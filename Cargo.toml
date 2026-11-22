@@ -7,7 +7,7 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.88"
 license = "Apache-2.0"
-repository = "https://github.com/OWNER/sandwatch"
+repository = "https://github.com/StrangeAssembly/sandwatch"
 
 [workspace.dependencies]
 anyhow = "1"

@@ -102,4 +102,5 @@ The most valuable contribution is recordings, especially real agent sessions. Se
 
 ## License
 
-Apache-2.0 planned for code (to be finalized before first public release).
+Apache License 2.0. See [LICENSE](LICENSE). The eBPF program in `crates/sensor/bpf/` is
+dual-licensed GPL-2.0-only OR Apache-2.0, as the Linux kernel requires for GPL-only helpers.

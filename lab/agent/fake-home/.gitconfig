@@ -1,0 +1,5 @@
+[user]
+    name = Lab Agent
+    email = agent@lab.invalid
+[init]
+    defaultBranch = main

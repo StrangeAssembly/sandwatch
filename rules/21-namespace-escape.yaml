@@ -1,0 +1,20 @@
+id: namespace-escape
+name: New user or mount namespace requested
+severity: medium
+stage: escape
+attack: [T1611]
+description: >
+  The workload asked the kernel for a new user or mount namespace (unshare/setns). Creating
+  a user namespace is a common first step in privilege-escalation chains, because it
+  unlocks capabilities inside the new namespace.
+false_positive_notes: >
+  Browsers (Chromium sandbox), bubblewrap/Flatpak and some build tools create namespaces
+  legitimately. Agent workloads normally do not. Allow-list known binaries per policy if
+  needed.
+match:
+  class: process
+  activities: [Namespace Change]
+  flags_any: [CLONE_NEWUSER, CLONE_NEWNS]
+aggregate:
+  min_distinct: 1
+  window_s: 60

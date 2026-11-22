@@ -1,0 +1,12 @@
+id: chain
+name: Multi-stage intrusion chain
+kind: chain
+severity: critical
+attack: [T1611, T1552, T1041]
+description: >
+  Alerts from three or more DIFFERENT attack stages (discovery, escape, credential access,
+  egress, collection) in the same session within ten minutes. Any single stage can have an
+  innocent explanation. A progression across stages rarely does.
+chain:
+  min_stages: 3
+  window_s: 600

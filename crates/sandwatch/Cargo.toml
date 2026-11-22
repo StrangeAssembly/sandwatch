@@ -1,0 +1,23 @@
+[package]
+name = "sandwatch"
+description = "Flight recorder and tripwire for AI agents"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "sandwatch"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+catena.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+swrec.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+sandwatch-sensor = { path = "../sensor" }
+ctrlc = { version = "3", features = ["termination"] }

@@ -1,0 +1,18 @@
+[package]
+name = "sandwatch-sensor"
+description = "Sandwatch live eBPF sensor (Linux)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+build = "build.rs"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+anyhow.workspace = true
+aya = "0.13"
+catena.workspace = true
+hex.workspace = true
+libc = "0.2"
+serde_json.workspace = true
+sha2.workspace = true
+swrec.workspace = true

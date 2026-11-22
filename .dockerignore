@@ -1,0 +1,6 @@
+recordings
+lab/out
+target
+.git
+**/*.swrec
+**/*.swrec.gz

@@ -1,0 +1,24 @@
+id: sandbox-fingerprint
+name: Sandbox / container fingerprinting
+severity: medium
+stage: discovery
+attack: [T1613, T1082, T1497]
+description: >
+  Reads several of the files used to tell whether a process is inside a container, and which
+  one: container marker files, PID 1's cgroup/scheduler/mount info. One read is normal; a
+  cluster of them in a few seconds is a process working out what kind of box it is in.
+false_positive_notes: >
+  Runtimes read /proc/self/cgroup and /proc/self/mountinfo to find CPU and memory limits
+  (JVM, Node, Go, df), so those alone stay below the threshold. Reading PID 1's files and
+  /.dockerenv is uncommon for application code.
+match:
+  class: file
+  activities: [Open, Get Attributes, Get Security]
+  path_any:
+    - '^/\.dockerenv$'
+    - '^/run/\.containerenv$'
+    - '^/proc/1/(cgroup|sched|mountinfo|mounts|environ|status|cmdline)$'
+    - '^/proc/self/(cgroup|mountinfo)$'
+aggregate:
+  min_distinct: 3
+  window_s: 10

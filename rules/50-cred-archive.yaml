@@ -1,0 +1,30 @@
+id: cred-archive
+name: Credentials packed into an archive
+severity: high
+stage: collection
+attack: [T1560.001, T1552.001]
+description: >
+  An archiving tool READ two or more different kinds of credential file. Bundling secrets is
+  the usual step right before exfiltration.
+false_positive_notes: >
+  Packaging a project can include its .env; extracting an archive writes one. Neither
+  counts: only reads count, and copies of the same file name count once. Backing up home
+  directories is the main legitimate case. Run backup jobs under their own policy.
+match:
+  class: file
+  activities: [Open]
+  access: read
+  actor_name_any: [tar, bsdtar, zip, gzip, 7z, 7za, rar, cpio, pax]
+  path_any:
+    - '/?\.aws/(credentials|config)$'
+    - '/?\.ssh/(id_[^/]*|[^/]*\.pem)$'
+    - '\.git-credentials$'
+    - '/?\.docker/config\.json$'
+    - '/?\.kube/config$'
+    - '/?\.netrc$'
+    - '(^|/)\.env$'
+    - '(^|/)etc/(shadow|gshadow)$'
+aggregate:
+  min_distinct: 2
+  window_s: 60
+  distinct_by: basename

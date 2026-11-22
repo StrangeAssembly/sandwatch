@@ -1,0 +1,37 @@
+# Sandwatch recording lab.
+# The lab network is internal: containers can reach each other but NOT the internet or your LAN.
+name: sandwatch-lab
+
+networks:
+  labnet:
+    internal: true
+    ipam:
+      config:
+        - subnet: 10.66.0.0/24
+
+services:
+  # Stand-in for things an escaping agent goes looking for: a fake cloud metadata API,
+  # a fake exfiltration collector, and a few listening "database" ports.
+  labsvc:
+    build: ./labsvc
+    image: sandwatch-lab-labsvc:0.1
+    networks:
+      labnet:
+        ipv4_address: 10.66.0.20
+        aliases: [metadata, collector, db]
+
+  # The monitored workload. Runs as an unprivileged user, no extra capabilities,
+  # no docker.sock, default seccomp profile.
+  agent:
+    build: ./agent
+    image: sandwatch-lab-agent:0.1
+    profiles: ["run"]
+    user: agent
+    working_dir: /app
+    depends_on: [labsvc]
+    networks:
+      labnet:
+        ipv4_address: 10.66.0.10
+    volumes:
+      - ./:/lab:ro          # scenarios + harness (read-only)
+      - ./out:/out          # raw sensor output

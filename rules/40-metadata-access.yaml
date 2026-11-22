@@ -1,0 +1,18 @@
+id: metadata-access
+name: Cloud instance-metadata access
+severity: high
+stage: egress
+attack: [T1552.005]
+description: >
+  Connection to a cloud instance-metadata endpoint. From inside a workload this is the
+  classic path to the host's cloud credentials.
+false_positive_notes: >
+  Cloud SDKs inside a workload may legitimately query metadata for region or identity. If
+  that is expected, declare it in the workload's policy. Agents should not need it.
+match:
+  class: network
+  activities: [Open, Traffic]
+  dst_ip_any: ['169.254.169.254', '169.254.170.2', 'fd00:ec2::254']
+aggregate:
+  min_distinct: 1
+  window_s: 60

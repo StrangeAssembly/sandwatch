@@ -1,0 +1,48 @@
+id: tempo-burst
+name: Machine-speed sensitive-target sweep
+severity: medium
+attack: [T1083]
+description: >
+  Ten or more distinct sensitive targets (escape surface, credentials, sandbox markers)
+  within two seconds, at least half of them failing. A person can't type that fast. This is
+  automated enumeration: a script, a scanner, or an agent trying everything at once.
+  This rule has no stage: tempo raises how urgent an incident is, but isn't an attack step.
+false_positive_notes: >
+  Speed alone is normal for agents and build tools (installers do thousands of file
+  operations a second). The rule only counts SENSITIVE targets, and requires that most of
+  them fail.
+match:
+  class: file
+  path_any:
+    # sandbox markers
+    - '^/\.dockerenv$'
+    - '^/run/\.containerenv$'
+    - '^/proc/1/'
+    # escape surface
+    - 'docker\.sock$'
+    - 'containerd\.sock$'
+    - 'crio\.sock$'
+    - 'podman\.sock$'
+    - '/serviceaccount/'
+    - '^/proc/sys/kernel/(core_pattern|modprobe)$'
+    - 'release_agent$'
+    - '^/dev/(kmsg|mem|kmem|port)$'
+    - '^/proc/(kcore|sysrq-trigger)$'
+    - '^/sys/kernel/(debug|security)(/|$)'
+    - '^/var/lib/kubelet(/|$)'
+    - '^/etc/(kubernetes/|rancher/)'
+    # credentials
+    - '/\.aws/'
+    - '/\.ssh/'
+    - '\.git-credentials$'
+    - '/\.docker/config\.json$'
+    - '/\.kube/'
+    - '/\.netrc$'
+    - '^/etc/(shadow|gshadow|sudoers)$'
+    - '^/proc/[0-9]+/environ$'
+    - '(^|/)\.env$'
+    - '^/(run|opt|srv)/secrets(/|$)'
+aggregate:
+  min_distinct: 10
+  min_failure_ratio: 0.5
+  window_s: 2

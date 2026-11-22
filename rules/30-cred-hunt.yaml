@@ -1,0 +1,35 @@
+id: cred-hunt
+name: Credential hunting
+severity: high
+stage: credential-access
+attack: [T1552.001, T1552.007, T1003.008]
+description: >
+  Touches several credential stores (cloud keys, SSH keys, token files, .env, other
+  processes' environments, /etc/shadow) in a short time, AND several of those lookups fail.
+  Failing lookups are the key signal: legitimate code knows where its one credential lives,
+  while a hunter tries the usual locations to see what exists.
+false_positive_notes: >
+  Copying or committing a project touches its .env; `ls ~/.ssh` stats key files. Those touch
+  a few paths successfully. The failure requirement keeps them from firing.
+match:
+  class: file
+  activities: [Open, Get Attributes, Get Security]
+  path_any:
+    - '/\.aws/(credentials|config)$'
+    - '/\.ssh/(id_[^/]*|[^/]*\.pem)$'
+    - '\.git-credentials$'
+    - '/\.docker/config\.json$'
+    - '/\.kube/config$'
+    - '/\.netrc$'
+    - '/\.config/gcloud/'
+    - '^/etc/(shadow|gshadow)$'
+    - '^/proc/[0-9]+/environ$'
+    - '(^|/)\.env$'
+    - '^/run/secrets(/|$)'
+    - '/serviceaccount/token$'
+    - '/\.bash_history$'
+    - '\.kdbx$'
+aggregate:
+  min_distinct: 4
+  min_failures: 2
+  window_s: 60

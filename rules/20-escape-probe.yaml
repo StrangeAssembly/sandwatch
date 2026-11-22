@@ -1,0 +1,35 @@
+id: escape-probe
+name: Container escape-surface probing
+severity: high
+stage: escape
+attack: [T1611, T1613]
+description: >
+  Checks for the things a container escape needs: container runtime sockets, Kubernetes
+  service-account tokens, host filesystem mounts, writable kernel interfaces (core_pattern,
+  cgroup release_agent), raw kernel/memory devices, kubelet state.
+false_positive_notes: >
+  Normal application workloads have no reason to look for runtime sockets or kernel
+  interfaces. Exceptions are infrastructure tools (Docker-in-Docker CI, node agents), which
+  should run under a separate policy rather than lowering this threshold.
+match:
+  class: file
+  path_any:
+    - 'docker\.sock$'
+    - 'containerd\.sock$'
+    - 'crio\.sock$'
+    - 'podman\.sock$'
+    - '/serviceaccount/token$'
+    - '^/proc/1/root(/|$)'
+    - '^/proc/sys/kernel/(core_pattern|modprobe|unprivileged_userns_clone)$'
+    - '^/proc/sys/user/max_user_namespaces$'
+    - 'release_agent$'
+    - '^/dev/(kmsg|mem|kmem|port)$'
+    - '^/proc/(kcore|sysrq-trigger)$'
+    - '^/(host|rootfs)(/|$)'
+    - '^/sys/kernel/(debug|security)(/|$)'
+    - '^/var/lib/kubelet(/|$)'
+    - '^/etc/kubernetes/'
+    - 'k3s\.yaml$'
+aggregate:
+  min_distinct: 3
+  window_s: 60

@@ -1,0 +1,8 @@
+# raw sensor output (converted recordings live in recordings/)
+lab/out/
+# legacy uncompressed recordings from before the Sandwatch rename (superseded by *.swrec.gz)
+recordings/*.aegis
+# Rust build output (normally in a Docker volume, but just in case)
+target/
+__pycache__/
+*.pyc

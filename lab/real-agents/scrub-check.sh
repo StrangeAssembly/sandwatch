@@ -10,10 +10,16 @@
 # credential-looking strings in command lines. Exit 1 if anything is found.
 set -uo pipefail
 me=$(id -un); host=$(hostname)
-pat="(/home/(?!agent\b|node\b)[A-Za-z0-9._-]+|/Users/|[A-Za-z]:\\\\\\\\|\b\Q$me\E\b|\b\Q$host\E\b"
+# Home directories of real accounts on this machine (agents also probe /home/CLAUDE.md and
+# similar parent-directory files, which are harmless, so only actual homes are flagged).
+homes=$(getent passwd | awk -F: '$6 ~ "^/home/[^/]+$" {print $6}' | sed 's/[.]/\\./g' | paste -sd'|' -)
+pat="(${homes:+(?:$homes)(?:/|\\b)|}/Users/|[A-Za-z]:\\\\\\\\|\b\Q$me\E\b|\b\Q$host\E\b"
 pat+="|[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"
 pat+="|\b192\.168\.\d+\.\d+|\b10\.0\.2\.\d+"
-pat+="|(?i)(api[_-]?key|token|secret|password|passwd|bearer)\s*[=:]\s*[^\s\"]{6,}|sk-ant-[A-Za-z0-9_-]+)"
+# account/session ids (UUIDs) and the names of items synced to an account
+pat+="|\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b"
+pat+="|\.claude/(?:skills|plugins)/synced/[^/\"]+/(?!item-\d+|\.staging)[^/\"]+"
+pat+="|(?i)(api[_-]?key|token|secret|password|passwd|bearer)\s*[=:]\s*(?!<redacted>)[^\s\"]{6,}|sk-ant-[A-Za-z0-9_-]+)"
 bad=0
 for f in "$@"; do
   hits=$(gzip -dc "$f" | grep -noP "$pat" | sort -t: -k2 -u | head -20)

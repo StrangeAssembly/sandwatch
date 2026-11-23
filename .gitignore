@@ -6,3 +6,5 @@ recordings/*.aegis
 target/
 __pycache__/
 *.pyc
+# raw real-agent recordings identify the recording machine/account; only redacted copies are committed
+recordings/real/raw/

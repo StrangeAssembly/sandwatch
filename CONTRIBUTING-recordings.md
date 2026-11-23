@@ -54,7 +54,17 @@ Recordings contain file paths, command lines, hostnames and IP addresses. Before
 - [ ] Recorded in a lab environment, not your personal machine or a production system
 - [ ] No real usernames, hostnames, internal domains or IPs you aren't willing to publish
 - [ ] No real secrets anywhere in command lines or paths (search for `key`, `token`, `secret`, `password`)
+- [ ] Redacted: `python3 tools/swrec_redact.py raw.swrec.gz your.swrec.gz` replaces account
+      and session ids (UUIDs), names synced to your agent account, real home directories,
+      your user and host name, emails and credential-looking values, and re-seals the hash
+      chain. Add `--term <text>` for anything else that identifies you.
+- [ ] Checked: `lab/real-agents/scrub-check.sh your.swrec.gz` prints `clean` (run it on the
+      machine you recorded on: it also looks for that machine's own user and host names)
 - [ ] The recording verifies: `python3 tools/swrec_verify.py your.swrec`
+
+Agent tools keep per-account state in the agent's home directory (for Claude Code,
+`~/.claude/`). The sensor never records file contents, but the *paths* there carry account
+ids, which is why redaction is required for real agent sessions.
 
 If in doubt, don't submit: open an issue describing the session instead.
 

@@ -8,16 +8,19 @@
 # 3. opens a shell in the container: run `claude`, give it the task, exit when done
 # 4. stops the sensor and the container
 #
-# Before committing a recording, run lab/real-agents/scrub-check.sh on it.
+# Recordings land in recordings/real/raw/ (git-ignored: they identify the recording machine
+# and account). Publish a redacted copy:
+#   python3 tools/swrec_redact.py recordings/real/raw/X.swrec.gz recordings/real/X.swrec.gz
+#   lab/real-agents/scrub-check.sh recordings/real/X.swrec.gz      # must print "clean"
 set -euo pipefail
 SCEN=${1:?scenario id from lab/real-agents/manifest.json}
 SEED=${2:-1}
 IMAGE=sandwatch-real-agent:0.1
-OUT=recordings/real/$SCEN-s$SEED.swrec.gz
+OUT=recordings/real/raw/$SCEN-s$SEED.swrec.gz
 SW=${SANDWATCH:-target/release/sandwatch}
 
 docker image inspect $IMAGE >/dev/null 2>&1 || docker build -q -t $IMAGE lab/real-agents
-mkdir -p recordings/real
+mkdir -p recordings/real/raw
 CID=$(docker run -d --rm -v sandwatch-agent-home:/home/agent $IMAGE)
 trap 'docker rm -f "$CID" >/dev/null 2>&1 || true' EXIT
 
@@ -30,7 +33,9 @@ sleep 6   # let the sensor attach its tracepoints
 echo "Recording $SCEN (seed $SEED). In the shell: run 'claude', give it the task, exit when done."
 docker exec -it "$CID" bash -l || true
 
-sudo kill -INT "$SENSOR" 2>/dev/null || true
+# Signal the sensor itself: background jobs of a script ignore SIGINT, so `sudo` (which is
+# $SENSOR) would not pass it on and the recording would never be finished.
+sudo pkill -INT -f "sandwatch watch --container $CID" 2>/dev/null || true
 wait "$SENSOR" || true
 echo "--- sensor output"
 cat "/tmp/$SCEN-s$SEED.alerts.txt"

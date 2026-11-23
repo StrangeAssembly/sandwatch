@@ -75,6 +75,21 @@ what the sensor is watching for.
   final exec, which is the workload starting, is kept.
 - `session.rs` runs the loop: drain the ring buffer, normalize, write, evaluate, respond.
 
+## Sensor health
+
+Once a second the sensor checks its loss counters. When events were dropped since the last
+check, it does three things:
+- prints a live warning;
+- emits an `Event Loss` event (class 9001, see `recording-format.md`) into the event
+  stream, so the gap is on the recording's timeline and rules can react to it;
+- puts the final totals in the footer's `sensor_stats`.
+
+The `sensor-blinding` rule alerts when one report lost 10,000 or more events. A syscall
+flood is a way to blind the sensor (MITRE T1562.006), so the rule's stage is
+*defense-evasion*: on its own it is a medium alert, and together with two other attack
+stages it completes a chain. Counting *repeated* reports would be a weaker signal: under a
+flood the sensor gets little CPU, and its once-a-second checks merge into one.
+
 ## Response
 
 `--freeze-on <rule ids>` writes `1` to the watched cgroup's `cgroup.freeze` when a listed

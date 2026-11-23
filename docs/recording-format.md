@@ -205,6 +205,19 @@ Fields: `process` (target/child process, same shape as `actor.process`), `unmapp
 Fields: `dst_endpoint.ip`, `dst_endpoint.port`, or `dst_endpoint.path` for Unix sockets;
 `connection_info.protocol_name` (`tcp`, `udp`, `unix`) when known.
 
+### Sensor health (live recordings)
+
+The live sensor reports facts about itself as events of class `9001` (`Sensor Health`), which
+is not an OCSF class. The only activity so far is `1` `Event Loss`: events were dropped
+since the previous report.
+- `unmapped.lost` holds how many were dropped since that report, per buffer
+  (`ring_buffer`, `pending`, `burst_buffer`); `unmapped.lost_total` holds the running
+  totals.
+- `unmapped.flags` contains `EVENTS_LOST`, plus `EVENTS_LOST_MAJOR` when 10,000 or more
+  events were lost in that report.
+- The event is timed at the latest event processed before the loss was noticed. It marks
+  where on the timeline the gap was detected; it does not say exactly when the gap happened.
+
 ## Footer
 
 ```json

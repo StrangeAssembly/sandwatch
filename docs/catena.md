@@ -101,6 +101,7 @@ low 0.2, medium 0.4, high 0.6, critical 0.8. Three high-severity stages score 0.
 | `egress-expand` | egress | ≥8 destinations in 60 s, ≥3 failing (DNS/loopback excluded) |
 | `cred-archive` | collection | an archiver reading ≥2 different credential files |
 | `tempo-burst` | (modifier) | ≥10 sensitive targets in 2 s, ≥50% failing |
+| `sensor-blinding` | defense-evasion | the sensor lost ≥10,000 events in one report (syscall flood) |
 | `chain` | — | ≥3 distinct stages in 10 min |
 
 ## Testing rules

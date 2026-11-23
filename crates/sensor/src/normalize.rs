@@ -254,6 +254,8 @@ pub struct Normalizer {
     users: HashMap<u32, String>,
     pub phases: Vec<(String, i64)>,
     pub last_epoch_ms: i64,
+    /// Latest event time seen, in microseconds since session start.
+    pub last_t_us: i64,
     /// Events dropped because they came from container-runtime init processes.
     pub dropped_runtime: u64,
 }
@@ -276,6 +278,7 @@ impl Normalizer {
             users: HashMap::new(),
             phases: vec![],
             last_epoch_ms: 0,
+            last_t_us: 0,
             dropped_runtime: 0,
         }
     }
@@ -388,6 +391,7 @@ impl Normalizer {
         let time = self.epoch_ms(r.ts_ns);
         self.last_epoch_ms = self.last_epoch_ms.max(time);
         let t_us = (r.ts_ns.saturating_sub(t0) / 1000) as i64;
+        self.last_t_us = self.last_t_us.max(t_us);
 
         let (status, errno) = match sp.kind {
             Kind::Terminate => ("Success", None),

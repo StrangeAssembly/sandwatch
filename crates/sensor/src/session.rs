@@ -32,6 +32,44 @@ pub struct Options {
     pub stop_grace: Duration,
 }
 
+/// Event class for facts about the sensor itself (not part of OCSF's standard classes).
+pub const CLASS_SENSOR_HEALTH: u32 = 9001;
+
+/// Losses at least this large in one report are flagged `EVENTS_LOST_MAJOR`. Real agent
+/// sessions lose nothing at all; a flood that meaningfully blinds the sensor loses far more.
+/// (Counting reports is not a reliable "sustained" signal: under a flood the sensor gets
+/// little CPU, so its once-a-second checks merge into one.)
+pub const MAJOR_LOSS: u64 = 10_000;
+
+/// An "Event Loss" event: the sensor dropped events since the previous report. It is timed
+/// at the latest event processed (not the wall clock), so a processing backlog does not
+/// make older events look late to the rule windows. `report` numbers the reports, which
+/// makes each one a distinct target.
+fn event_loss(norm: &Normalizer, lost: (u64, u64, u64), total: (u64, u64, u64), report: u64) -> Value {
+    let n = lost.0 + lost.1 + lost.2;
+    let flags = if n >= MAJOR_LOSS {
+        format!("EVENTS_LOST EVENTS_LOST_MAJOR report={report}")
+    } else {
+        format!("EVENTS_LOST report={report}")
+    };
+    json!({
+        "time": norm.last_epoch_ms,
+        "class_uid": CLASS_SENSOR_HEALTH,
+        "class_name": "Sensor Health",
+        "activity_id": 1,
+        "activity_name": "Event Loss",
+        "status": "Failure",
+        "status_detail": "EVENTS_LOST",
+        "actor": {"process": {"name": "sandwatch-sensor", "pid": std::process::id()}},
+        "unmapped": {
+            "t_us": norm.last_t_us,
+            "flags": flags,
+            "lost": {"ring_buffer": lost.0, "pending": lost.1, "burst_buffer": lost.2},
+            "lost_total": {"ring_buffer": total.0, "pending": total.1, "burst_buffer": total.2},
+        },
+    })
+}
+
 /// Size cap of the in-memory burst buffer between the ring-buffer reader and detection.
 /// At ~360 bytes per typical record this holds ~700k events: tens of seconds of a busy agent.
 const BURST_BUFFER_BYTES: usize = 256 << 20;
@@ -381,6 +419,8 @@ pub fn run(
     // happens (at most once a second), not only in the footer.
     let mut last_drop_check = Instant::now();
     let mut reported_drops = (0u64, 0u64, 0u64);
+    let mut loss_reports = 0u64;
+    let mut loss_event: Option<Value> = None;
     loop {
         if last_drop_check.elapsed() >= Duration::from_secs(1) {
             last_drop_check = Instant::now();
@@ -392,6 +432,11 @@ pub fn run(
                      burst buffer {} so far); detection is incomplete while this lasts",
                     d.0, d.1, d.2
                 );
+                // The loss itself becomes an event: it is recorded on the timeline and rules
+                // can react to it (a workload may flood syscalls to blind the sensor).
+                loss_reports += 1;
+                let lost = (d.0 - reported_drops.0, d.1 - reported_drops.1, d.2 - reported_drops.2);
+                loss_event = Some(event_loss(&norm, lost, d, loss_reports));
                 reported_drops = d;
             }
         }
@@ -402,9 +447,15 @@ pub fn run(
         };
         let got = batch.lens.len();
         reader.release(batch.data.len());
+        let mut evs: Vec<Value> = Vec::with_capacity(got + 1);
+        evs.extend(loss_event.take());
         for rec in batch.records() {
             let Some(raw) = RawEvent::from_bytes(rec) else { continue };
-            let Some(mut ev) = norm.normalize(&raw) else { continue };
+            if let Some(ev) = norm.normalize(&raw) {
+                evs.push(ev);
+            }
+        }
+        for mut ev in evs {
             ev["seq"] = json!(seq + 1);
             ev["record_type"] = json!("event");
             // Deserialize from a borrow: no per-event clone of the JSON tree.
@@ -456,6 +507,28 @@ pub fn run(
         }
     }
     let buffer_drops = reader.join();
+    // Report losses since the last once-a-second check (e.g. a flood in the final second).
+    {
+        let (r, p) = sensor.drops();
+        let d = (r, p, buffer_drops);
+        if d != reported_drops {
+            loss_reports += 1;
+            let lost = (d.0 - reported_drops.0, d.1 - reported_drops.1, d.2 - reported_drops.2);
+            let mut ev = event_loss(&norm, lost, d, loss_reports);
+            ev["seq"] = json!(seq + 1);
+            ev["record_type"] = json!("event");
+            if let Ok(typed) = <swrec::Event as serde::Deserialize>::deserialize(&ev) {
+                for a in engine.process(&typed) {
+                    on_alert(&a, None);
+                }
+                if tx.send(ev).is_err() {
+                    drop(tx);
+                    join_writer(writer_thread)?;
+                    anyhow::bail!("recording writer stopped unexpectedly");
+                }
+            }
+        }
+    }
 
     // Run mode: the session owns the workload. Whatever is still running in its cgroup when
     // the session ends (stopped, timed out, or the launched command exited but left
@@ -543,5 +616,30 @@ mod tests {
         let got: Vec<&[u8]> = b.records().collect();
         assert_eq!(got, vec![&b"abc"[..], &b""[..], &b"de"[..]]);
         assert_eq!(Batch::default().records().count(), 0);
+    }
+}
+
+#[cfg(test)]
+mod loss_tests {
+    use super::*;
+
+    #[test]
+    fn event_loss_is_a_valid_event_that_the_rule_matches() {
+        let norm = Normalizer::new("t");
+        let mut ev = event_loss(&norm, (9_000, 0, 1_000), (9_000, 0, 1_000), 1);
+        ev["seq"] = json!(1);
+        ev["record_type"] = json!("event");
+        let typed = <swrec::Event as serde::Deserialize>::deserialize(&ev).expect("valid event");
+        assert_eq!(typed.activity_name, "Event Loss");
+        let rules = catena::load_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/../../rules")).unwrap();
+        let blinding = rules.iter().find(|r| r.id() == "sensor-blinding").expect("rule shipped");
+        assert!(blinding.match_event(&typed).is_some());
+        assert_eq!(ev["unmapped"]["lost"]["burst_buffer"], 1_000);
+        // below the threshold: recorded, but the rule does not match
+        let mut small = event_loss(&norm, (5, 0, 0), (5, 0, 0), 2);
+        small["seq"] = json!(2);
+        small["record_type"] = json!("event");
+        let small = <swrec::Event as serde::Deserialize>::deserialize(&small).unwrap();
+        assert!(blinding.match_event(&small).is_none());
     }
 }

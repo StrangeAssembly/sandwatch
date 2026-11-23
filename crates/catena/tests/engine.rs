@@ -251,3 +251,58 @@ fn shuffled_arrival_within_lateness_matches_timestamp_order() {
         assert_eq!(a, b, "round {round}");
     }
 }
+
+// ---- sensor-blinding: the sensor reports its own event loss as events ----
+
+fn loss_ev(seq: u64, t_us: i64, report: u64, lost: u64) -> Event {
+    let flags = if lost >= 10_000 {
+        format!("EVENTS_LOST EVENTS_LOST_MAJOR report={report}")
+    } else {
+        format!("EVENTS_LOST report={report}")
+    };
+    serde_json::from_value(json!({
+        "seq": seq, "time": 1_000_000 + t_us / 1000, "class_uid": 9001,
+        "activity_id": 1, "activity_name": "Event Loss", "status": "Failure",
+        "status_detail": "EVENTS_LOST",
+        "actor": {"process": {"name": "sandwatch-sensor", "pid": 1}},
+        "unmapped": {"t_us": t_us, "flags": flags,
+                     "lost": {"ring_buffer": lost, "pending": 0, "burst_buffer": 0}}
+    }))
+    .unwrap()
+}
+
+fn shipped() -> Vec<Rule> {
+    catena::load_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/../../rules")).unwrap()
+}
+
+#[test]
+fn small_losses_are_recorded_but_do_not_alert() {
+    let evs = [loss_ev(1, 0, 1, 500), loss_ev(2, 1_000_000, 2, 9_999)];
+    let ids = fired(&shipped(), &evs);
+    assert!(!ids.contains(&"sensor-blinding".to_string()), "{ids:?}");
+}
+
+#[test]
+fn major_loss_fires_sensor_blinding() {
+    let ids = fired(&shipped(), &[loss_ev(1, 0, 1, 10_000)]);
+    assert!(ids.contains(&"sensor-blinding".to_string()), "{ids:?}");
+}
+
+#[test]
+fn flooding_plus_two_attack_stages_completes_the_chain() {
+    // discovery (fingerprint) + credential-access (cred-hunt) + defense-evasion (blinding)
+    let fp = ["/.dockerenv", "/proc/1/cgroup", "/proc/1/sched"];
+    let creds = ["/root/.ssh/id_rsa", "/root/.aws/credentials", "/root/.kube/config", "/root/.netrc"];
+    let mut evs = Vec::new();
+    let mut seq = 0;
+    let mut next = || { seq += 1; seq };
+    for (i, p) in fp.iter().enumerate() {
+        evs.push(file_ev(next(), i as i64 * 1000, p, None));
+    }
+    for (i, p) in creds.iter().enumerate() {
+        evs.push(file_ev(next(), 10_000 + i as i64 * 1000, p, Some("ENOENT")));
+    }
+    evs.push(loss_ev(next(), 20_000, 1, 250_000));
+    let ids = fired(&shipped(), &evs);
+    assert!(ids.contains(&"chain".to_string()), "{ids:?}");
+}

@@ -1,0 +1,22 @@
+id: sensor-blinding
+name: Sensor flooded, events lost
+severity: medium
+stage: defense-evasion
+attack: [T1562.006]
+description: >
+  The sensor lost 10,000 or more events in one report: the watched workload produced
+  syscalls far faster than Sandwatch can record them. While that lasts, other detections
+  are blind. A workload can do this on purpose (a syscall flood) to hide what it does
+  alongside. Smaller losses are recorded as Event Loss events and warned about live, but
+  do not alert.
+false_positive_notes: >
+  The recorded real agent sessions peak around 120k events/s and lose nothing; the sensor
+  is lossless to roughly 400k/s on a 4-vCPU host (docs/sensor.md). Very heavy parallel
+  builds or test suites on small hosts can still exceed that. On its own this is a medium
+  alert, not an attack step; with two other attack stages it completes a chain.
+match:
+  activities: [Event Loss]
+  flags_any: [EVENTS_LOST_MAJOR]
+aggregate:
+  min_distinct: 1
+  window_s: 60

@@ -29,7 +29,13 @@ import socket
 import sys
 
 ZERO_HASH = "0" * 64
-UUID = re.compile(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b", re.I)
+# Hex lookarounds, not \b: ids are often glued to "_" (e.g. "<org>_<account>"), and "_" is a
+# word character, so \b would miss them.
+UUID = re.compile(r"(?<![0-9a-f])[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?![0-9a-f])", re.I)
+# Runs of 8+ hex digits: redacted inside an agent's state directory (.claude/...), where
+# they are account, session and job ids or hashes of them.
+HEXRUN = re.compile(r"(?<![0-9a-f])[0-9a-f]{8,}(?![0-9a-f])", re.I)
+STATE_DIR = ".claude/"
 SYNCED = re.compile(r"(\.claude/(?:skills|plugins)/synced/[^/\"]+/)([^/\"]+)")
 EMAIL = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
 SECRET = re.compile(r"(?i)\b([A-Za-z0-9_]*(?:api[_-]?key|token|secret|password|passwd|bearer))(\s*[=:]\s*)[^\s\"]{6,}")
@@ -55,10 +61,18 @@ def local_homes():
 
 
 class Redactor:
-    def __init__(self, terms):
+    def __init__(self, terms, known_ids=()):
         self.uuids, self.items, self.count = {}, {}, 0
         self.homes = [re.compile(re.escape(h) + r"(?=/|\b)") for h in local_homes()]
         self.terms = [re.compile(r"\b" + re.escape(t) + r"\b") for t in terms if t and t not in GENERIC_USERS]
+        # Short forms of ids seen anywhere in the file (tools print the first group of a
+        # UUID, e.g. job directories named after a session id).
+        shorts = sorted({u.split("-")[0].lower() for u in known_ids})
+        self.short = re.compile(r"(?<![0-9a-f])(" + "|".join(shorts) + r")(?![0-9a-f])", re.I) if shorts else None
+
+    def _hex(self, m):
+        k = m.group(0).lower()
+        return self.uuids.setdefault(k, f"id-{len(self.uuids) + 1:04d}")
 
     def _sub(self, pattern, repl, s):
         s2, n = pattern.subn(repl, s)
@@ -84,7 +98,13 @@ class Redactor:
         for t in self.terms:
             s = self._sub(t, "<redacted>", s)
         s = self._sub(UUID, self._uuid, s)
+        if self.short:
+            s = self._sub(self.short, self._hex, s)
         s = self._sub(SYNCED, self._item, s)
+        i = s.find(STATE_DIR)
+        if i >= 0:
+            j = i + len(STATE_DIR)
+            s = s[:j] + self._sub(HEXRUN, self._hex, s[j:])
         return s
 
     def value(self, v):
@@ -107,10 +127,12 @@ def main():
         sys.exit("refusing to overwrite the original; write to a new file")
 
     terms = a.term + [os.environ.get("USER", ""), socket.gethostname()]
-    red = Redactor(terms)
     opener = lambda p, m: gzip.open(p, m, encoding="utf-8") if p.endswith(".gz") else open(p, m, encoding="utf-8")
     with opener(a.src, "rt") as f:
-        lines = [json.loads(l) for l in f if l.strip()]
+        raw = [l for l in f if l.strip()]
+    known = set(UUID.findall("\n".join(raw)))  # first pass: every full id in the file
+    red = Redactor(terms, known)
+    lines = [json.loads(l) for l in raw]
     if not lines or lines[0].get("record_type") != "header":
         sys.exit("not a recording (first line is not a header)")
     original_final = lines[-1].get("hash")

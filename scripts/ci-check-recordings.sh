@@ -28,7 +28,9 @@ echo "fixtures checked"
 
 # live-freeze/ is excluded on purpose: those sessions are frozen before the later attack
 # stages run, so their "expected detections" can never all fire.
-echo "== eval gate (strace lab + live sensor sessions)"
-"$SW" eval recordings/*.swrec.gz recordings/live | tail -4 || fail=1
+echo "== eval gate (strace lab + live sensor sessions + real agent sessions)"
+gate=(recordings/*.swrec.gz recordings/live)
+[[ -d recordings/real ]] && gate+=(recordings/real)
+"$SW" eval "${gate[@]}" | tail -4 || fail=1
 
 exit $fail

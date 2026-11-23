@@ -17,7 +17,9 @@ pat="(${homes:+(?:$homes)(?:/|\\b)|}/Users/|[A-Za-z]:\\\\\\\\|\b\Q$me\E\b|\b\Q$h
 pat+="|[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"
 pat+="|\b192\.168\.\d+\.\d+|\b10\.0\.2\.\d+"
 # account/session ids (UUIDs) and the names of items synced to an account
-pat+="|\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b"
+# (hex lookarounds, not \b: ids are often glued to "_", which \b treats as part of a word)
+pat+="|(?<![0-9a-fA-F])[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}(?![0-9a-fA-F])"
+pat+="|\.claude/[^\"]*?(?<![0-9a-fA-F])[0-9a-fA-F]{8,}(?![0-9a-fA-F])"
 pat+="|\.claude/(?:skills|plugins)/synced/[^/\"]+/(?!item-\d+|\.staging)[^/\"]+"
 pat+="|(?i)(api[_-]?key|token|secret|password|passwd|bearer)\s*[=:]\s*(?!<redacted>)[^\s\"]{6,}|sk-ant-[A-Za-z0-9_-]+)"
 bad=0

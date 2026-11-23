@@ -51,6 +51,29 @@ aggregate:
 A **target** is what the event touched: the file path, `ip:port`, `unix:/path`, or
 `Activity(flags)` for process events. Each rule fires at most once per session (v0.1).
 
+Rules are checked when they load, beyond YAML field names:
+- `window_s` must be finite and > 0.
+- `min_distinct` must be ≥ 1, and `min_failures` must not exceed it.
+- `min_failure_ratio` must be within 0–1.
+- `status` must be `any`, `success` or `failure`; `access` must be `read` or `write`.
+- CIDR prefixes must fit the address family (`/0`–`/32` for IPv4, `/0`–`/128` for IPv6).
+- A `match` must constrain something, so a rule cannot match every event by accident.
+- Chains need `min_stages` ≥ 2. Rule ids must be unique.
+
+### Event order
+
+Events do not always arrive in timestamp order. The live sensor timestamps a syscall when
+it starts and delivers it when it returns, so a slow call can arrive after faster, later
+ones. Every window is anchored to the **newest timestamp seen so far** and covers
+`[newest - window_s, newest]`:
+- A late event that still falls inside a rule's window is counted at its true time, and
+  later expires at the right moment.
+- A late event older than the window is ignored by that rule. It stays in the recording
+  and is counted in the footer's `catena_stats`.
+
+So detection results do not depend on arrival order, except for events that are later than
+the window itself.
+
 ## Writing a chain rule
 
 ```yaml

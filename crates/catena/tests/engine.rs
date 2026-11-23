@@ -132,3 +132,122 @@ fn shipped_rules_load() {
     let rules = catena::load_dir(dir).expect("rules/ loads");
     assert!(rules.len() >= 8);
 }
+
+// ---- out-of-order arrival (live sensor: timestamp at syscall entry, delivery at exit) ----
+
+const THREE_IN_1S: &str = r#"
+id: three
+name: three
+severity: high
+stage: escape
+description: test
+match:
+  class: file
+  path_any: ['^/secret/']
+aggregate:
+  min_distinct: 3
+  window_s: 1
+"#;
+
+fn sorted(mut evs: Vec<Event>) -> Vec<Event> {
+    evs.sort_by_key(|e| e.unmapped.t_us);
+    evs
+}
+
+fn fired(rules: &[Rule], evs: &[Event]) -> Vec<String> {
+    run(rules, evs).into_iter().map(|a| a.rule_id).collect()
+}
+
+#[test]
+fn late_event_inside_window_is_evicted_at_its_true_time() {
+    // Needs 4 distinct in 1 s. b@0.3 s arrives after c@0.5 s. From e@1.4 s on the window
+    // starts at 0.4 s, so a and b are out: {c, e, f} never reaches 4. Appending b at the
+    // back (old behavior) left it stuck behind c, alive forever, and fired on {c, b, e, f}.
+    let r = rule(&THREE_IN_1S.replace("min_distinct: 3", "min_distinct: 4"));
+    let evs = vec![
+        file_ev(1, 0, "/secret/a", None),
+        file_ev(2, 500_000, "/secret/c", None),
+        file_ev(3, 300_000, "/secret/b", None),
+        file_ev(4, 1_400_000, "/secret/e", None),
+        file_ev(5, 1_450_000, "/secret/f", None),
+    ];
+    assert!(fired(&[r.clone()], &evs).is_empty());
+    assert_eq!(fired(&[r.clone()], &evs), fired(&[r], &sorted(evs)));
+}
+
+#[test]
+fn event_older_than_window_is_ignored_and_counted() {
+    // b@0.2 s arrives after c@1.5 s: already outside [0.5, 1.5], so it cannot count.
+    let r = rule(THREE_IN_1S);
+    let evs = vec![
+        file_ev(1, 0, "/secret/a", None),
+        file_ev(2, 1_500_000, "/secret/c", None),
+        file_ev(3, 200_000, "/secret/b", None),
+        file_ev(4, 1_600_000, "/secret/d", None),
+    ];
+    let mut eng = catena::Engine::new(vec![r.clone()]);
+    for e in &evs {
+        eng.process(e);
+    }
+    assert!(eng.alerts().is_empty());
+    assert_eq!(fired(&[r], &sorted(evs)), Vec::<String>::new(), "same as timestamp order");
+    let s = eng.order_stats();
+    assert_eq!(s.reordered_events, 1);
+    assert_eq!(s.late_events_ignored, 1);
+    assert_eq!(s.max_lateness_us, 1_300_000);
+}
+
+#[test]
+fn audit_case_0_2_1_seconds() {
+    // Timestamps 0 s, 2 s, 1 s with a 1.5 s window: the late 1 s event is inside
+    // [0.5, 2] and counts together with the 2 s one; the 0 s one is out.
+    let r = rule(&THREE_IN_1S.replace("min_distinct: 3", "min_distinct: 2").replace("window_s: 1", "window_s: 1.5"));
+    let evs = vec![
+        file_ev(1, 0, "/secret/a", None),
+        file_ev(2, 2_000_000, "/secret/c", None),
+        file_ev(3, 1_000_000, "/secret/b", None),
+    ];
+    let alerts = run(&[r], &evs);
+    assert_eq!(alerts.len(), 1);
+    assert_eq!(alerts[0].distinct, 2);
+    assert!(alerts[0].evidence.iter().all(|e| !e.contains("/secret/a")));
+}
+
+#[test]
+fn shuffled_arrival_within_lateness_matches_timestamp_order() {
+    // Deterministic pseudo-random jitter: each event delayed by < 50 ms. The stream spans
+    // 1.8 s, inside every shipped window (>= 2 s), so nothing expires and counts only grow:
+    // for rules with monotone thresholds the fired set must not depend on arrival order.
+    // (A min_failure_ratio threshold is not monotone, so such rules are excluded.)
+    let rules: Vec<Rule> = catena::load_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/../../rules"))
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.def.aggregate.as_ref().is_none_or(|a| a.min_failure_ratio == 0.0))
+        .collect();
+    let paths = ["/root/.ssh/id_rsa", "/root/.aws/credentials", "/root/.kube/config",
+                 "/root/.docker/config.json", "/root/.git-credentials", "/root/.netrc",
+                 "/var/run/docker.sock", "/proc/1/environ", "/proc/sys/kernel/core_pattern",
+                 "/.dockerenv", "/proc/1/cgroup", "/app/main.py", "/etc/hosts"];
+    let mut seed: u64 = 0x5eed;
+    let mut next = || {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        seed >> 33
+    };
+    for round in 0..50 {
+        let mut evs = Vec::new();
+        for i in 0..60u64 {
+            let p = paths[(next() as usize) % paths.len()];
+            let t = (i as i64) * 30_000 + (round as i64) * 7;
+            let err = if next() % 2 == 0 { Some("ENOENT") } else { None };
+            evs.push((t + (next() % 50_000) as i64, file_ev(i + 1, t, p, err)));
+        }
+        let ts_order: Vec<Event> = evs.iter().map(|(_, e)| e.clone()).collect();
+        evs.sort_by_key(|(arrival, _)| *arrival);
+        let arrival_order: Vec<Event> = evs.into_iter().map(|(_, e)| e).collect();
+        let mut a = fired(&rules, &arrival_order);
+        let mut b = fired(&rules, &ts_order);
+        a.sort();
+        b.sort();
+        assert_eq!(a, b, "round {round}");
+    }
+}

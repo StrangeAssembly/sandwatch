@@ -44,13 +44,20 @@ struct Window {
 }
 
 impl Window {
+    /// Insert keeping `entries` sorted by time, so front eviction stays exact even when an
+    /// event arrives after newer ones (late events are rare and near the back: cheap).
     fn push(&mut self, t: i64, target: String, failed: bool) {
         let c = self.counts.entry(target.clone()).or_insert((0, 0));
         c.0 += 1;
         if failed {
             c.1 += 1;
         }
-        self.entries.push_back((t, target, failed));
+        if self.entries.back().is_none_or(|b| b.0 <= t) {
+            self.entries.push_back((t, target, failed));
+        } else {
+            let at = self.entries.partition_point(|e| e.0 <= t);
+            self.entries.insert(at, (t, target, failed));
+        }
     }
     fn evict_before(&mut self, cutoff: i64) {
         while let Some((t, _, _)) = self.entries.front() {
@@ -99,6 +106,28 @@ pub struct Engine {
     fired: HashSet<String>,
     stage_hits: Vec<StageHit>,
     alerts: Vec<Alert>,
+    /// Latest event time seen (µs): the "now" every window is anchored to.
+    watermark: i64,
+    stats: OrderStats,
+}
+
+/// How far event arrival order departed from timestamp order.
+///
+/// The live sensor timestamps a syscall at ENTRY but delivers it at EXIT, so with
+/// concurrent threads a slow call arrives after faster, later ones. Catena's policy:
+/// every window covers `[watermark - window_s, watermark]`, where the watermark is the
+/// newest timestamp seen. A late event that still falls inside a rule's window is inserted
+/// at its true time; one older than the window is ignored by that rule (it is still kept
+/// in the recording). This makes results independent of arrival order except for events
+/// later than the window itself.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+pub struct OrderStats {
+    /// Events that arrived after an event with a newer timestamp.
+    pub reordered_events: u64,
+    /// Events ignored by at least one matching rule because they were older than its window.
+    pub late_events_ignored: u64,
+    /// Largest lateness seen, in microseconds.
+    pub max_lateness_us: i64,
 }
 
 impl Engine {
@@ -106,12 +135,29 @@ impl Engine {
         let (chains, detect): (Vec<_>, Vec<_>) =
             rules.into_iter().partition(|r| r.def.kind == RuleKind::Chain);
         let windows = detect.iter().map(|_| Window::default()).collect();
-        Engine { detect, chains, windows, fired: HashSet::new(), stage_hits: vec![], alerts: vec![] }
+        Engine {
+            detect,
+            chains,
+            windows,
+            fired: HashSet::new(),
+            stage_hits: vec![],
+            alerts: vec![],
+            watermark: i64::MIN,
+            stats: OrderStats::default(),
+        }
     }
 
-    /// Feed one event (events must arrive in time order). Returns alerts raised by it.
+    /// Feed one event. Events may arrive somewhat out of timestamp order; see
+    /// [`OrderStats`] for the policy. Returns alerts raised by it.
     pub fn process(&mut self, ev: &Event) -> Vec<Alert> {
         let t = ev.unmapped.t_us;
+        if t < self.watermark {
+            self.stats.reordered_events += 1;
+            self.stats.max_lateness_us = self.stats.max_lateness_us.max(self.watermark - t);
+        }
+        self.watermark = self.watermark.max(t);
+        let now = self.watermark;
+        let mut ignored_late = false;
         let mut new_alerts = Vec::new();
         for (i, rule) in self.detect.iter().enumerate() {
             if self.fired.contains(rule.id()) {
@@ -119,9 +165,14 @@ impl Engine {
             }
             let Some(target) = rule.match_event(ev) else { continue };
             let agg = rule.def.aggregate.as_ref().expect("compiled detect rule has aggregate");
+            let cutoff = now - (agg.window_s * 1e6) as i64;
+            if t < cutoff {
+                ignored_late = true; // older than this rule's window: cannot contribute
+                continue;
+            }
             let w = &mut self.windows[i];
             w.push(t, target, rule.counts_as_failure(ev));
-            w.evict_before(t - (agg.window_s * 1e6) as i64);
+            w.evict_before(cutoff);
             let distinct = w.distinct();
             let failed = w.distinct_failed();
             let ratio = if distinct == 0 { 0.0 } else { failed as f64 / distinct as f64 };
@@ -153,8 +204,11 @@ impl Engine {
                 }
             }
         }
+        if ignored_late {
+            self.stats.late_events_ignored += 1;
+        }
         if !new_alerts.is_empty() {
-            new_alerts.extend(self.check_chains(t, ev.time));
+            new_alerts.extend(self.check_chains(now, ev.time));
         }
         self.alerts.extend(new_alerts.iter().cloned());
         new_alerts
@@ -210,6 +264,10 @@ impl Engine {
 
     pub fn alerts(&self) -> &[Alert] {
         &self.alerts
+    }
+
+    pub fn order_stats(&self) -> OrderStats {
+        self.stats
     }
 
     pub fn rules(&self) -> impl Iterator<Item = &Rule> {

@@ -8,5 +8,5 @@
 pub mod engine;
 pub mod rules;
 
-pub use engine::{run, Alert, ChainLink, Engine};
+pub use engine::{run, Alert, ChainLink, Engine, OrderStats};
 pub use rules::{load_dir, Rule, RuleDef, Severity};

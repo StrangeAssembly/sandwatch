@@ -12,7 +12,8 @@ Recordings are the test fixtures for Sandwatch detection rules. Every rule must 
    Falco, auditd, or Sysmon. Detection rules never see sensor-specific details.
 2. **OCSF-aligned.** Events use [OCSF](https://schema.ocsf.io) class IDs, activity IDs and field
    names where they exist. Anything OCSF has no field for lives under `unmapped`.
-3. **Replayable.** Events are in time order and carry microsecond timing, so tempo analysis works.
+3. **Replayable.** Events carry microsecond timing, so tempo analysis works. Converted
+   (strace) recordings are in time order; live ones are in arrival order (see Footer).
 4. **Tamper-evident.** Every line is hash-chained to the previous one.
 5. **Plain text.** One JSON object per line (JSONL), UTF-8. May be gzip-compressed as `.swrec.gz`.
 
@@ -20,7 +21,7 @@ Recordings are the test fixtures for Sandwatch detection rules. Every rule must 
 
 ```
 line 1        header   (record_type = "header")
-line 2..N-1   events   (record_type = "event"), ordered by time
+line 2..N-1   events   (record_type = "event"), seq 1..N-2
 line N        footer   (record_type = "footer")
 ```
 
@@ -209,6 +210,32 @@ Fields: `dst_endpoint.ip`, `dst_endpoint.port`, or `dst_endpoint.path` for Unix 
 ```json
 {"record_type": "footer", "event_count": 1834, "final_event_hash": "…", "prev_hash": "…", "hash": "…"}
 ```
+
+Live recordings also put `duration_ms`, `start_time`, `ground_truth`, `sensor_stats` and
+`catena_stats` in the footer, because they are only known when the session ends. Readers
+merge `duration_ms`, `event_count` and `ground_truth` into the session metadata when the
+header lacks them.
+
+`catena_stats` reports how far the live event stream departed from timestamp order (the
+sensor timestamps a syscall at entry but delivers it at exit):
+`reordered_events`, `late_events_ignored`, `max_lateness_us`. Events are written in
+**arrival** order, so `t_us` is not guaranteed to be monotonic in live recordings.
+
+## Structural rules (normative)
+
+A recording verifies only if **all** of these hold. `sandwatch verify` and
+`tools/swrec_verify.py` enforce the same list, and both are tested against the shared
+fixtures in `crates/swrec/tests/fixtures/` (`ok-*` must pass, `bad-*` must fail).
+
+1. Line 1 is the header. Blank lines are ignored.
+2. Every line's `prev_hash` equals the previous line's `hash` (all zeros for line 1), and
+   `hash` is the SHA-256 described above.
+3. Event `seq` values are exactly 1, 2, 3, … in file order.
+4. There is exactly one footer, and nothing after it.
+5. The footer's `event_count` equals the number of events.
+6. If the header has a non-zero `session.event_count`, it equals the number of events.
+7. A file that cannot be read completely (for example a truncated gzip stream or invalid
+   JSON) fails verification.
 
 ## Versioning
 

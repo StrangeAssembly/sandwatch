@@ -24,6 +24,8 @@ def verify(path):
     header = footer = None
     with opener(path, "rt", encoding="utf-8") as f:
         for lineno, line in enumerate(f, 1):
+            if not line.strip():
+                continue  # blank lines are ignored (as by the Rust reader)
             obj = json.loads(line)
             stored = obj.pop("hash", None)
             if obj.get("prev_hash") != prev:
@@ -43,6 +45,8 @@ def verify(path):
                 if obj.get("seq") != n_events:
                     return f"line {lineno}: seq {obj.get('seq')} != expected {n_events}"
             elif rt == "footer":
+                if footer is not None:
+                    return f"line {lineno}: duplicate footer"
                 footer = obj
             else:
                 return f"line {lineno}: unknown record_type {rt!r}"
@@ -52,7 +56,7 @@ def verify(path):
     if footer["event_count"] != n_events:
         return f"footer event_count {footer['event_count']} != {n_events} events"
     hc = header["session"].get("event_count")  # optional: live recordings put it in the footer
-    if hc is not None and hc != n_events:
+    if hc and hc != n_events:  # 0 / absent = "not known up front" (same as the Rust reader)
         return "header event_count does not match"
     return None
 
@@ -60,7 +64,11 @@ def verify(path):
 def main(paths):
     bad = 0
     for p in paths:
-        err = verify(p)
+        try:
+            err = verify(p)
+        except (OSError, EOFError, ValueError, KeyError, TypeError, AttributeError) as e:
+            # truncated gzip, invalid JSON/UTF-8, malformed header: a failure, not a crash
+            err = f"unreadable: {type(e).__name__}: {e}"
         print(f"{'OK  ' if err is None else 'FAIL'}  {p}" + (f"  -- {err}" if err else ""))
         bad += err is not None
     print(f"\n{len(paths) - bad}/{len(paths)} recordings verified")

@@ -25,8 +25,16 @@ WINDOW_US = 2_000_000
 def load(path):
     opener = gzip.open if path.endswith(".gz") else open
     with opener(path, "rt", encoding="utf-8") as f:
-        lines = [json.loads(l) for l in f]
-    return lines[0], [l for l in lines if l.get("record_type") == "event"]
+        lines = [json.loads(l) for l in f if l.strip()]
+    header = lines[0]
+    footer = next((l for l in lines if l.get("record_type") == "footer"), {})
+    # Live recordings put duration/counts in the footer; merge them into the session
+    # metadata the way the Rust reader does (header values win when present).
+    session = header.setdefault("session", {})
+    for k in ("duration_ms", "event_count", "start_time"):
+        if not session.get(k) and footer.get(k) is not None:
+            session[k] = footer[k]
+    return header, [l for l in lines if l.get("record_type") == "event"]
 
 
 def stats(header, events):
@@ -56,7 +64,7 @@ def stats(header, events):
         "events": len(events),
         "procs": len(procs),
         "launch": launches,
-        "secs": header["session"]["duration_ms"] / 1000,
+        "secs": header["session"].get("duration_ms", 0) / 1000,
         "fail%": 100 * fails / len(fileish) if fileish else 0,
         "sens": len(sens_targets),
         "sensFail": len(sens_fail),

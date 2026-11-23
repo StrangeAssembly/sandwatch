@@ -222,6 +222,11 @@ pub fn load(path: impl AsRef<Path>, verify: bool) -> Result<(Recording, Integrit
     let mut events = Vec::new();
     let mut footer_count: Option<u64> = None;
     let mut footer_extra: Option<Value> = None;
+    // First structural violation (same rules as tools/swrec_verify.py).
+    let mut structure: Option<String> = None;
+    fn flag(s: &mut Option<String>, msg: String) {
+        s.get_or_insert(msg);
+    }
 
     for (i, line) in reader.lines().enumerate() {
         let lineno = i + 1;
@@ -255,17 +260,38 @@ pub fn load(path: impl AsRef<Path>, verify: bool) -> Result<(Recording, Integrit
             "event" => {
                 let ev: Event = serde_json::from_value(v)
                     .with_context(|| format!("line {lineno}: parsing event"))?;
+                if footer_extra.is_some() {
+                    flag(&mut structure, format!("line {lineno}: event after footer"));
+                }
+                let expected = events.len() as u64 + 1;
+                if ev.seq != expected {
+                    flag(&mut structure, format!("line {lineno}: seq {} != expected {expected}", ev.seq));
+                }
                 events.push(ev);
             }
             "footer" => {
-                footer_count = v.get("event_count").and_then(|c| c.as_u64());
-                footer_extra = Some(v);
+                if footer_extra.is_some() {
+                    // Keep the first footer's metadata; a second one is a structural error.
+                    flag(&mut structure, format!("line {lineno}: duplicate footer"));
+                } else {
+                    footer_count = v.get("event_count").and_then(|c| c.as_u64());
+                    footer_extra = Some(v);
+                }
             }
             other => bail!("line {lineno}: unexpected record_type {other:?}"),
         }
     }
 
     let mut header = header.ok_or_else(|| anyhow!("{}: missing header", path.display()))?;
+    // Optional in the header (live recordings put it in the footer), but must agree if set.
+    if header.session.event_count != 0 && header.session.event_count != events.len() as u64 {
+        flag(&mut structure, "header event_count does not match".into());
+    }
+    if verify && integrity == Integrity::Verified {
+        if let Some(s) = structure {
+            integrity = Integrity::Broken(s);
+        }
+    }
     // Live recordings carry counts, duration and phases in the footer.
     if let Some(f) = &footer_extra {
         if header.ground_truth.phases.is_empty() {
@@ -419,10 +445,113 @@ mod tests {
         assert_eq!(
             canon,
             format!(
-                r#"{{"event_count":0,"final_event_hash":"{z}","prev_hash":"{z}","record_type":"footer"}}"#,
-                z = ZERO_HASH
+                r#"{{"event_count":0,"final_event_hash":"{ZERO_HASH}","prev_hash":"{ZERO_HASH}","record_type":"footer"}}"#
             )
         );
         assert_eq!(line_hash(ZERO_HASH, &o).len(), 64);
+    }
+
+    // ---- structural contract: shared fixtures (also checked by tools/swrec_verify.py) ----
+
+    fn fixtures_dir() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
+    }
+
+    fn hdr(event_count: Option<u64>) -> Value {
+        let mut h = json!({"format": "sandwatch-recording", "format_version": "0.2",
+                           "session": {"id": "fixture"}});
+        if let Some(c) = event_count {
+            h["session"]["event_count"] = json!(c);
+        }
+        h
+    }
+
+    fn ev(seq: u64) -> Value {
+        json!({"record_type": "event", "seq": seq, "time": 1000 + seq as i64,
+               "class_uid": 1001, "activity_id": 14, "activity_name": "Open",
+               "status": "Success", "file": {"path": format!("/f{seq}")},
+               "unmapped": {"t_us": seq * 10}})
+    }
+
+    fn foot(count: u64) -> Value {
+        json!({"record_type": "footer", "event_count": count})
+    }
+
+    /// Write records with a VALID hash chain (so only the structure is wrong).
+    fn write_chain(name: &str, header: Value, records: &[Value]) -> std::path::PathBuf {
+        let p = fixtures_dir().join(name);
+        let mut w = Writer::create(&p, header).unwrap();
+        for r in records {
+            w.write_line(r.clone()).unwrap();
+        }
+        w.out.flush().unwrap();
+        drop(w);
+        p
+    }
+
+    fn edit_line(p: &std::path::Path, lineno: usize, f: impl Fn(&mut Value)) {
+        let text = std::fs::read_to_string(p).unwrap();
+        let mut lines: Vec<String> = text.lines().map(String::from).collect();
+        let mut v: Value = serde_json::from_str(&lines[lineno - 1]).unwrap();
+        f(&mut v);
+        lines[lineno - 1] = canonical(&v);
+        std::fs::write(p, lines.join("\n") + "\n").unwrap();
+    }
+
+    /// Regenerate tests/fixtures: `cargo test -p swrec -- --ignored regenerate_fixtures`
+    #[test]
+    #[ignore]
+    fn regenerate_fixtures() {
+        std::fs::create_dir_all(fixtures_dir()).unwrap();
+        for gz in ["ok-minimal.swrec", "ok-minimal.swrec.gz"] {
+            let mut w = Writer::create(fixtures_dir().join(gz), hdr(None)).unwrap();
+            w.event(ev(0)).unwrap();
+            w.event(ev(0)).unwrap();
+            w.finish(json!({"duration_ms": 20})).unwrap();
+        }
+        write_chain("ok-header-count.swrec", hdr(Some(2)), &[ev(1), ev(2), foot(2)]);
+        write_chain("bad-seq.swrec", hdr(None), &[ev(1), ev(3), foot(2)]);
+        write_chain("bad-event-after-footer.swrec", hdr(None), &[ev(1), foot(1), ev(2)]);
+        write_chain("bad-duplicate-footer.swrec", hdr(None), &[ev(1), foot(1), foot(1)]);
+        write_chain("bad-missing-footer.swrec", hdr(None), &[ev(1), ev(2)]);
+        write_chain("bad-footer-count.swrec", hdr(None), &[ev(1), ev(2), foot(3)]);
+        write_chain("bad-header-count.swrec", hdr(Some(5)), &[ev(1), ev(2), foot(2)]);
+        let p = write_chain("bad-hash.swrec", hdr(None), &[ev(1), ev(2), foot(2)]);
+        edit_line(&p, 2, |v| v["file"]["path"] = json!("/edited"));
+        let p = write_chain("bad-prev-hash.swrec", hdr(None), &[ev(1), ev(2), foot(2)]);
+        edit_line(&p, 3, |v| v["prev_hash"] = json!(ZERO_HASH));
+        // truncated gzip: cut the compressed stream in half
+        let full = std::fs::read(fixtures_dir().join("ok-minimal.swrec.gz")).unwrap();
+        std::fs::write(fixtures_dir().join("bad-truncated.swrec.gz"), &full[..full.len() / 2]).unwrap();
+    }
+
+    #[test]
+    fn fixtures_follow_the_structural_contract() {
+        let mut n = 0;
+        for entry in std::fs::read_dir(fixtures_dir()).expect("tests/fixtures exists") {
+            let p = entry.unwrap().path();
+            let name = p.file_name().unwrap().to_string_lossy().to_string();
+            if !name.contains(".swrec") {
+                continue;
+            }
+            n += 1;
+            let res = load(&p, true);
+            if name.starts_with("ok-") {
+                let (rec, integ) = res.unwrap_or_else(|e| panic!("{name}: {e:#}"));
+                assert_eq!(integ, Integrity::Verified, "{name}");
+                assert_eq!(rec.events.len(), 2, "{name}");
+            } else {
+                let ok = matches!(res, Ok((_, Integrity::Verified)));
+                assert!(!ok, "{name} must fail verification");
+            }
+        }
+        assert!(n >= 12, "expected the fixture corpus, found {n} files");
+    }
+
+    #[test]
+    fn footer_metadata_is_merged_into_header() {
+        let (rec, integ) = load(fixtures_dir().join("ok-minimal.swrec"), true).unwrap();
+        assert_eq!(integ, Integrity::Verified);
+        assert_eq!(rec.header.session.duration_ms, 20, "merged from footer");
     }
 }

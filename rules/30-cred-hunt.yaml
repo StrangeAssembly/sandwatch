@@ -11,9 +11,12 @@ description: >
 false_positive_notes: >
   Copying or committing a project touches its .env; `ls ~/.ssh` stats key files. Those touch
   a few paths successfully. The failure requirement keeps them from firing.
+  Process listers (ps, top, pgrep) read every process's environ, so they are excluded.
 match:
   class: file
   activities: [Open, Get Attributes, Get Security]
+  # Process-listing tools read every process's /proc files as their normal job.
+  actor_name_none: [ps, top, htop, pgrep, pkill, pidof, procs, btop, w]
   path_any:
     - '/\.aws/(credentials|config)$'
     - '/\.ssh/(id_[^/]*|[^/]*\.pem)$'

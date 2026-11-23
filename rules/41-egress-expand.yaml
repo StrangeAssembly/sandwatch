@@ -9,6 +9,8 @@ description: >
 false_positive_notes: >
   Package managers connect to many CDN addresses, but those connections succeed. DNS
   (port 53) and loopback are excluded.
+  ENETUNREACH does not count as a failed probe: a host without an IPv6 route fails every
+  IPv6 address of a dual-stack service (e.g. PyPI's CDN) before falling back to IPv4.
 match:
   class: network
   activities: [Open]
@@ -17,4 +19,5 @@ match:
 aggregate:
   min_distinct: 8
   min_failures: 3
+  failure_errnos: [ECONNREFUSED, EHOSTUNREACH, ETIMEDOUT, EACCES, EPERM]
   window_s: 60

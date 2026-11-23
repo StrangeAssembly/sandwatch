@@ -34,6 +34,7 @@ match:                            # every listed condition must hold
   path_none: [...]                # regex, none may match
   access: read                    # opens only: read | write
   actor_name_any: [tar, zip]      # acting process basename
+  actor_name_none: [ps, top]      # ignore these programs (their normal job hits the targets)
   flags_any: [CLONE_NEWUSER]      # substring of raw syscall flags
   dst_ip_any: ['169.254.169.254', '10.0.0.0/8']    # exact or CIDR
   dst_ip_none: ['127.0.0.0/8']
@@ -119,3 +120,19 @@ The v0.1 thresholds were written by the same person who wrote the scenarios, wit
 of the lab data. A perfect score on that data is a **regression test**, not proof that the
 rules generalize. Real validation needs recordings the rules were not designed against:
 real agent sessions and other people's environments. See `CONTRIBUTING-recordings.md`.
+
+**First real session (v0.3).** The first recorded Claude Code session (`recordings/real/`:
+clone a repo, fix an issue, run its tests) raised four false alerts under the v0.3 rules,
+including a chain, so `--freeze-on chain` would have frozen a legitimate agent three
+minutes in:
+- `sandbox-fingerprint` and `cred-hunt`: the agent's routine `ps aux` reads PID 1's
+  status/cmdline/environ and every process's environ.
+- `egress-expand`: pip reaching PyPI from a container with no IPv6 route; each of the CDN's
+  four IPv6 addresses failed with ENETUNREACH before IPv4 worked.
+
+Process listers are now excluded from those two rules (`actor_name_none`), and ENETUNREACH
+no longer counts as a failed probe for `egress-expand`. The lab results are unchanged.
+Caveats:
+- Exclusions by program name can be evaded by an attacker who names a tool `ps`.
+- One session is not a benchmark. More real sessions are needed before these thresholds
+  mean much.

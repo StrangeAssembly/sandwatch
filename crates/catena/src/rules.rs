@@ -82,6 +82,10 @@ pub struct MatchDef {
     /// Acting process name (basename) must be one of these.
     #[serde(default)]
     pub actor_name_any: Vec<String>,
+    /// Acting process name (basename) must be none of these: tools whose normal job touches
+    /// the rule's targets (e.g. `ps` reads every process's /proc files).
+    #[serde(default)]
+    pub actor_name_none: Vec<String>,
     /// Destination IP: exact address or IPv4/IPv6 CIDR.
     #[serde(default)]
     pub dst_ip_any: Vec<String>,
@@ -276,6 +280,11 @@ impl Rule {
                 return None;
             }
         }
+        if let Some(name) = ev.actor_name() {
+            if m.actor_name_none.iter().any(|n| n == name) {
+                return None;
+            }
+        }
         if !m.flags_any.is_empty() {
             let flags = ev.unmapped.flags.as_deref()?;
             if !m.flags_any.iter().any(|f| flags.contains(f.as_str())) {
@@ -362,6 +371,7 @@ fn validate(def: &RuleDef) -> Result<()> {
             || !m.path_any.is_empty()
             || !m.path_none.is_empty()
             || !m.actor_name_any.is_empty()
+            || !m.actor_name_none.is_empty()
             || !m.dst_ip_any.is_empty()
             || !m.dst_ip_none.is_empty()
             || !m.dst_port_any.is_empty()
@@ -524,6 +534,9 @@ mod tests {
         let tar = ok_match("  actor_name_any: [tar, zip]");
         assert!(tar.match_event(&file_ev("/x", "Success", None, "tar")).is_some());
         assert!(tar.match_event(&file_ev("/x", "Success", None, "cat")).is_none());
+        let not_ps = ok_match("  class: file\n  actor_name_none: [ps, top]");
+        assert!(not_ps.match_event(&file_ev("/proc/1/environ", "Success", None, "ps")).is_none());
+        assert!(not_ps.match_event(&file_ev("/proc/1/environ", "Success", None, "cat")).is_some());
     }
 
     #[test]

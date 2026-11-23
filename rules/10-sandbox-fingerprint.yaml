@@ -11,9 +11,13 @@ false_positive_notes: >
   Runtimes read /proc/self/cgroup and /proc/self/mountinfo to find CPU and memory limits
   (JVM, Node, Go, df), so those alone stay below the threshold. Reading PID 1's files and
   /.dockerenv is uncommon for application code.
+  Process listers (ps, top, pgrep) read PID 1's status, cmdline and environ for every
+  listing, so they are excluded. Coding agents run `ps aux` routinely.
 match:
   class: file
   activities: [Open, Get Attributes, Get Security]
+  # Process-listing tools read every process's /proc files as their normal job.
+  actor_name_none: [ps, top, htop, pgrep, pkill, pidof, procs, btop, w]
   path_any:
     - '^/\.dockerenv$'
     - '^/run/\.containerenv$'

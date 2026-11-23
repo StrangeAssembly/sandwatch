@@ -98,11 +98,25 @@ evidence and process state stay intact.
   could change them before the kernel copies them in.
 - **Path resolution is best-effort.** It covers relative paths through cwd and directory
   fds; `dup`/`fcntl` fd tricks are not tracked.
-- **Event loss under heavy load.** In a real session, a burst of `pip install` work on a
-  4-vCPU VM overflowed the 16 MB ring buffer and lost about 45k events (23%). The loss is
-  counted in the footer (`sensor_stats.ring_buffer_drops`), but detection is blind during
-  it. A larger buffer, a faster consumer, and kernel-side filtering of high-volume,
-  low-value calls are planned.
+- **Event loss under extreme load.** A real session (Claude Code, pip and node all busy at
+  once) once lost about 23% of its events with the original 16 MB buffer and single-threaded
+  consumer. Since then:
+  - records are sized to the fields they use (~360 bytes instead of 1000);
+  - the ring buffer is 64 MB;
+  - the producer skips per-event wakeups;
+  - recording (canonical JSON, hashing, gzip at the fast level) runs on its own thread.
+
+  `lab/stress/syscall_storm.py` on a 4-vCPU VM:
+
+  | busy processes | syscalls/s | lost before | lost now |
+  |---|---|---|---|
+  | 1 | ~260k | 74% | 0% |
+  | 2 | ~400k | 87% | 31% |
+  | 4 | ~600k | 91% | 61% |
+
+  Loss is counted in the footer (`sensor_stats`) and warned about live. Detection is blind
+  while it lasts. Next steps: kernel-side filtering of high-volume, low-value calls (e.g.
+  successful `stat` of non-sensitive paths) and parallel normalization.
 - **One session per sensor process.** Fleet mode (many containers, one daemon) is planned.
 - **Capture limits.** argv is captured up to 6 arguments × 64 bytes, and paths up to 256 bytes.
 - **Seccomp-denied calls the sensor doesn't trace** (for example `keyctl`) are not seen.

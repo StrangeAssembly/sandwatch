@@ -38,15 +38,27 @@ pub fn cstr(b: &[u8]) -> String {
     String::from_utf8_lossy(&b[..end]).into_owned()
 }
 
+/// Shortest record the kernel sends: everything up to `path2` (events with one path).
+pub const MIN_RECORD: usize = std::mem::offset_of!(RawEvent, path2);
+
 impl RawEvent {
+    /// Parse a ring-buffer record. The kernel truncates records after the last field the
+    /// event uses (see `emit` in the BPF program); the missing tail reads as zeros.
     pub fn from_bytes(b: &[u8]) -> Option<Self> {
-        if b.len() < std::mem::size_of::<RawEvent>() {
+        if b.len() < MIN_RECORD {
             return None;
         }
-        // SAFETY: RawEvent is plain old data; length checked; read_unaligned handles alignment.
-        Some(unsafe { std::ptr::read_unaligned(b.as_ptr() as *const RawEvent) })
+        let n = b.len().min(std::mem::size_of::<RawEvent>());
+        // SAFETY: RawEvent is plain old data, so all-zero is valid; we copy at most
+        // size_of::<RawEvent>() bytes into it.
+        unsafe {
+            let mut r: RawEvent = std::mem::zeroed();
+            std::ptr::copy_nonoverlapping(b.as_ptr(), &mut r as *mut RawEvent as *mut u8, n);
+            Some(r)
+        }
     }
 }
+
 
 static BPF_OBJ: &[u8] = aya::include_bytes_aligned!(concat!(env!("OUT_DIR"), "/sensor.bpf.o"));
 
@@ -138,5 +150,25 @@ impl Sensor {
         let Ok(arr) = PerCpuArray::<_, u64>::try_from(map) else { return (0, 0) };
         let sum = |i: u32| arr.get(&i, 0).map(|v| v.iter().sum()).unwrap_or(0);
         (sum(0), sum(1))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn short_records_zero_fill() {
+        let mut full = [0u8; std::mem::size_of::<RawEvent>()];
+        full[std::mem::offset_of!(RawEvent, sc)] = 5;
+        full[std::mem::offset_of!(RawEvent, path)] = b'/';
+        full[std::mem::offset_of!(RawEvent, path2)] = b'x';
+        let r = RawEvent::from_bytes(&full[..MIN_RECORD]).expect("short record parses");
+        assert_eq!(r.sc, 5);
+        assert_eq!(r.path[0], b'/');
+        assert_eq!(r.path2[0], 0, "tail beyond the record is zero");
+        assert!(RawEvent::from_bytes(&full[..MIN_RECORD - 1]).is_none());
+        assert_eq!(RawEvent::from_bytes(&full).unwrap().path2[0], b'x');
+        assert_eq!(MIN_RECORD, 360);
     }
 }

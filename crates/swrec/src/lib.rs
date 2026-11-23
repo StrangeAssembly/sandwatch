@@ -327,7 +327,7 @@ pub fn load(path: impl AsRef<Path>, verify: bool) -> Result<(Recording, Integrit
 /// in the footer (readers merge them into the header). A crash leaves a verifiable prefix
 /// that `load` reports as truncated (missing footer).
 pub struct Writer {
-    out: Box<dyn std::io::Write>,
+    out: Box<dyn std::io::Write + Send>,
     prev: String,
     seq: u64,
 }
@@ -341,8 +341,9 @@ impl Writer {
             }
         }
         let f = File::create(path).with_context(|| format!("creating {}", path.display()))?;
-        let out: Box<dyn std::io::Write> = if path.to_string_lossy().ends_with(".gz") {
-            Box::new(flate2::write::GzEncoder::new(f, flate2::Compression::default()))
+        let out: Box<dyn std::io::Write + Send> = if path.to_string_lossy().ends_with(".gz") {
+            // fast level: compression was the largest per-event cost in the live sensor
+            Box::new(flate2::write::GzEncoder::new(f, flate2::Compression::fast()))
         } else {
             Box::new(std::io::BufWriter::new(f))
         };

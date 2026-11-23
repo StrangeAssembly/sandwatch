@@ -13,6 +13,7 @@ aya = "0.13"
 catena.workspace = true
 hex.workspace = true
 libc = "0.2"
+serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 swrec.workspace = true

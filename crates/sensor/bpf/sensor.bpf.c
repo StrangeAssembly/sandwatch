@@ -65,7 +65,7 @@ struct sw_event {
 
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
-    __uint(max_entries, 16 << 20);
+    __uint(max_entries, 64 << 20); /* 64 MB: absorbs bursts such as a big pip install */
 } events SEC(".maps");
 
 struct {
@@ -102,6 +102,22 @@ static __always_inline void bump(__u32 idx)
     __u64 *v = bpf_map_lookup_elem(&stats, &idx);
     if (v)
         __sync_fetch_and_add(v, 1);
+}
+
+/* Send only the part of the record an event uses: most events have one path and no argv
+ * (~360 bytes instead of 1000), so the ring buffer holds ~3x more of them. User space
+ * zero-fills the rest. BPF_RB_NO_WAKEUP: the consumer polls, so skip the per-event wakeup. */
+static __always_inline void emit(struct sw_event *e)
+{
+    long r;
+    if (e->argc)
+        r = bpf_ringbuf_output(&events, e, sizeof(*e), BPF_RB_NO_WAKEUP);
+    else if (e->path2[0])
+        r = bpf_ringbuf_output(&events, e, __builtin_offsetof(struct sw_event, argv), BPF_RB_NO_WAKEUP);
+    else
+        r = bpf_ringbuf_output(&events, e, __builtin_offsetof(struct sw_event, path2), BPF_RB_NO_WAKEUP);
+    if (r)
+        bump(0);
 }
 
 static __always_inline int is_watched(void)
@@ -240,8 +256,7 @@ static __always_inline int do_exit(struct exit_ctx *ctx, __u32 sc, int nargs, in
     struct sw_event *e = bpf_map_lookup_elem(&pending, &id);
     if (e) {
         e->ret = ctx->ret;
-        if (bpf_ringbuf_output(&events, e, sizeof(*e), 0))
-            bump(0);
+        emit(e);
         bpf_map_delete_elem(&pending, &id);
         return 0;
     }
@@ -259,8 +274,7 @@ static __always_inline int do_exit(struct exit_ctx *ctx, __u32 sc, int nargs, in
     if (saved_args(args))
         capture(s, sc, args, nargs, p1, p2, sock, argv_idx);
     s->ret = ctx->ret;
-    if (bpf_ringbuf_output(&events, s, sizeof(*s), 0))
-        bump(0);
+    emit(s);
     return 0;
 }
 
@@ -275,8 +289,7 @@ int sched_exit(void *ctx)
     struct sw_event *p = bpf_map_lookup_elem(&pending, &id);
     if (p) {
         p->ret = RET_UNFINISHED;
-        if (bpf_ringbuf_output(&events, p, sizeof(*p), 0))
-            bump(0);
+        emit(p);
         bpf_map_delete_elem(&pending, &id);
     }
     if ((__u32)id != (id >> 32) || !is_watched())
@@ -288,8 +301,7 @@ int sched_exit(void *ctx)
     fill_common(e, SC_TERMINATE);
     struct task_struct *t = (struct task_struct *)bpf_get_current_task();
     e->ret = BPF_CORE_READ(t, exit_code);
-    if (bpf_ringbuf_output(&events, e, sizeof(*e), 0))
-        bump(0);
+    emit(e);
     return 0;
 }
 

@@ -218,7 +218,25 @@ pub fn run(
     if let Some(l) = &opts.labels {
         header["labels"] = l.clone();
     }
-    let mut writer = swrec::Writer::create(&opts.out, header)?;
+    // Recording runs on its own thread: canonical JSON, hashing and gzip were most of the
+    // per-event cost, and doing them inline made the sensor fall behind the kernel under load.
+    // The bounded queue applies back-pressure (the kernel ring buffer absorbs it) instead of
+    // growing without limit.
+    let writer = swrec::Writer::create(&opts.out, header)?;
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Value>(8_192);
+    let writer_thread = std::thread::Builder::new()
+        .name("swrec-writer".into())
+        .spawn(move || -> Result<swrec::Writer> {
+            let mut w = writer;
+            for ev in rx {
+                w.event(ev)?;
+            }
+            Ok(w)
+        })?;
+    let join_writer = |h: std::thread::JoinHandle<Result<swrec::Writer>>| -> Result<swrec::Writer> {
+        h.join().map_err(|_| anyhow::anyhow!("recording writer thread panicked"))?
+    };
+    let mut seq: u64 = 0;
     let mut norm = Normalizer::new(&opts.session_id);
     let mut engine = Engine::new(rules);
     let mut frozen_by: Option<String> = None;
@@ -255,19 +273,37 @@ pub fn run(
     let started = Instant::now();
     let mut exit_code = None;
     let mut drain_until: Option<Instant> = None;
+    // Live loss warning: detection is blind while the kernel drops events, so say so as it
+    // happens (at most once a second), not only in the footer.
+    let mut last_drop_check = Instant::now();
+    let mut reported_drops = (0u64, 0u64);
     loop {
+        if last_drop_check.elapsed() >= Duration::from_secs(1) {
+            last_drop_check = Instant::now();
+            let d = sensor.drops();
+            if d != reported_drops {
+                eprintln!(
+                    "sandwatch: WARNING sensor is losing events (ring buffer {} / pending {} so far); \
+                     detection is incomplete while this lasts",
+                    d.0, d.1
+                );
+                reported_drops = d;
+            }
+        }
         let mut got = 0usize;
         while let Some(item) = sensor.ring.next() {
             got += 1;
             let Some(raw) = RawEvent::from_bytes(&item) else { continue };
             drop(item);
             let Some(mut ev) = norm.normalize(&raw) else { continue };
-            ev["seq"] = json!(writer.event_count() + 1);
+            ev["seq"] = json!(seq + 1);
             ev["record_type"] = json!("event");
-            let typed: swrec::Event = match serde_json::from_value(ev.clone()) {
+            // Deserialize from a borrow: no per-event clone of the JSON tree.
+            let typed = match <swrec::Event as serde::Deserialize>::deserialize(&ev) {
                 Ok(t) => t,
                 Err(_) => continue,
             };
+            seq += 1;
             for a in engine.process(&typed) {
                 on_alert(&a, typed.actor.process.cmd_line.as_deref());
                 if frozen_by.is_none() && opts.freeze_on.iter().any(|f| f == &a.rule_id) {
@@ -282,7 +318,12 @@ pub fn run(
                     }
                 }
             }
-            writer.event(ev)?;
+            if tx.send(ev).is_err() {
+                // The writer stopped (e.g. disk full): surface its error.
+                drop(tx);
+                join_writer(writer_thread)?;
+                anyhow::bail!("recording writer stopped unexpectedly");
+            }
         }
 
         if drain_until.is_none() {
@@ -321,6 +362,8 @@ pub fn run(
         Some(s) => norm.last_epoch_ms - s,
         None => 0,
     };
+    drop(tx);
+    let writer = join_writer(writer_thread)?;
     let events = writer.event_count();
     let phases: Vec<Value> =
         norm.phases.iter().map(|(n, t)| json!({"name": n, "time": t})).collect();

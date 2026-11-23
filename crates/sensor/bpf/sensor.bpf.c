@@ -146,15 +146,24 @@ static __always_inline void fill_common(struct sw_event *e, __u32 sc)
  * by seccomp, so it never really started). */
 #define SC_DENIED_BEFORE_ENTRY 0x8000
 
+#define SC_CLONE3 61
+
 /* Fill path/sockaddr/argv fields from a syscall argument vector. `args` is either the
  * tracepoint context (entry) or a stack copy of the saved user registers (exit). */
-static __always_inline void capture(struct sw_event *e, const __u64 *args, int nargs, int p1,
-                                    int p2, int sock, int argv_idx)
+static __always_inline void capture(struct sw_event *e, __u32 sc, const __u64 *args, int nargs,
+                                    int p1, int p2, int sock, int argv_idx)
 {
     e->a[0] = nargs > 0 ? args[0] : 0;
     e->a[1] = nargs > 1 ? args[1] : 0;
     e->a[2] = nargs > 2 ? args[2] : 0;
     e->a[3] = nargs > 3 ? args[3] : 0;
+    /* clone3(struct clone_args *uargs, size_t size): namespace flags live in user memory,
+     * in the first field (__u64 flags). Copy them into a[2] (clone3 has only two args). */
+    if (sc == SC_CLONE3) {
+        __u64 flags = 0;
+        bpf_probe_read_user(&flags, sizeof(flags), (const void *)args[0]);
+        e->a[2] = flags;
+    }
     if (p1 >= 0)
         bpf_probe_read_user_str(e->path, PATH_LEN, (const void *)args[IDX(p1)]);
     if (p2 >= 0)
@@ -194,7 +203,7 @@ static __always_inline int do_enter(struct enter_ctx *ctx, __u32 sc, int nargs, 
     if (!e)
         return 0;
     fill_common(e, sc);
-    capture(e, ctx->args, nargs, p1, p2, sock, argv_idx);
+    capture(e, sc, ctx->args, nargs, p1, p2, sock, argv_idx);
     __u64 id = bpf_get_current_pid_tgid();
     if (bpf_map_update_elem(&pending, &id, e, BPF_ANY))
         bump(1);
@@ -248,7 +257,7 @@ static __always_inline int do_exit(struct exit_ctx *ctx, __u32 sc, int nargs, in
     fill_common(s, sc | SC_DENIED_BEFORE_ENTRY);
     __u64 args[6] = {};
     if (saved_args(args))
-        capture(s, args, nargs, p1, p2, sock, argv_idx);
+        capture(s, sc, args, nargs, p1, p2, sock, argv_idx);
     s->ret = ctx->ret;
     if (bpf_ringbuf_output(&events, s, sizeof(*s), 0))
         bump(0);

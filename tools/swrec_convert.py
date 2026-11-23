@@ -292,6 +292,12 @@ class Converter:
                     aname = "Launch"
                 extra["process"] = self.snapshot(p)
             elif aname == "Fork":
+                # clone/clone3 creating namespaces: report as a namespace change (same as
+                # the live sensor), keeping the child process below.
+                ns = re.findall(r"\bCLONE_NEW[A-Z]+\b", args)
+                if ns:
+                    aid, aname = 99, "Namespace Change"
+                    unm["flags"] = "|".join(dict.fromkeys(ns))
                 if status == "Success" and val.isdigit():
                     child = self.proc(int(val), ts, parent=p)
                     # With -f the child's first lines can be logged before the parent's

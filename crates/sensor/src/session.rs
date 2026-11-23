@@ -28,6 +28,90 @@ pub struct Options {
     pub freeze_on: Vec<String>,
     pub duration: Option<Duration>,
     pub stop: Arc<AtomicBool>,
+    /// Run mode: how long the workload gets to exit after SIGTERM before its cgroup is killed.
+    pub stop_grace: Duration,
+}
+
+/// A workload launched by `run`, owned by the session. The session owns everything in the
+/// cgroup: when it ends (for any reason, including errors), every remaining process in the
+/// cgroup is terminated and the cgroup is removed. `Drop` guarantees this on error paths.
+struct Workload {
+    cgroup: PathBuf,
+    child: Option<std::process::Child>,
+    exit_code: Option<i32>,
+}
+
+impl Workload {
+    fn pids(&self) -> Vec<i32> {
+        std::fs::read_to_string(self.cgroup.join("cgroup.procs"))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| l.trim().parse().ok())
+            .collect()
+    }
+
+    fn reap(&mut self) -> Option<bool> {
+        let ch = self.child.as_mut()?;
+        match ch.try_wait() {
+            Ok(Some(st)) => {
+                self.exit_code = self.exit_code.or(st.code());
+                self.child = None;
+                Some(true)
+            }
+            Ok(None) => Some(false),
+            Err(_) => None,
+        }
+    }
+
+    /// Has the direct child exited? (Descendants may still be running.)
+    fn child_exited(&mut self) -> bool {
+        self.reap().unwrap_or(true)
+    }
+
+    /// Terminate everything in the cgroup. `grace`: send SIGTERM first and wait up to this
+    /// long (skipped for a frozen cgroup: frozen tasks cannot handle signals).
+    fn shutdown(&mut self, grace: Option<Duration>) {
+        if let Some(g) = grace.filter(|g| !g.is_zero()) {
+            for pid in self.pids() {
+                // SAFETY: plain kill(2).
+                unsafe { libc::kill(pid, libc::SIGTERM) };
+            }
+            let until = Instant::now() + g;
+            while Instant::now() < until && !self.pids().is_empty() {
+                self.reap();
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+        if !self.pids().is_empty() {
+            // cgroup.kill (Linux 5.14+) kills every task, frozen or not; fall back to SIGKILL.
+            if std::fs::write(self.cgroup.join("cgroup.kill"), "1").is_err() {
+                for pid in self.pids() {
+                    // SAFETY: plain kill(2).
+                    unsafe { libc::kill(pid, libc::SIGKILL) };
+                }
+            }
+        }
+        let _ = freeze(&self.cgroup, false);
+        if let Some(mut ch) = self.child.take() {
+            if let Ok(st) = ch.wait() {
+                self.exit_code = self.exit_code.or(st.code());
+            }
+        }
+        for _ in 0..100 {
+            if std::fs::remove_dir(&self.cgroup).is_ok() || !self.cgroup.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
+impl Drop for Workload {
+    fn drop(&mut self) {
+        if self.child.is_some() || self.cgroup.exists() {
+            self.shutdown(None);
+        }
+    }
 }
 
 pub struct Outcome {
@@ -38,6 +122,7 @@ pub struct Outcome {
     pub frozen_by: Option<String>,
     pub exit_code: Option<i32>,
     pub cgroup: PathBuf,
+    pub order: catena::OrderStats,
 }
 
 /// Find a container's cgroup directory by (a prefix of) its id.
@@ -106,6 +191,10 @@ pub fn run(
             (cg, Some(cmd.clone()), cmd.join(" "))
         }
     };
+    // Run mode owns the cgroup from creation: any early return below removes it (Drop).
+    let mut proc_handle = child
+        .is_some()
+        .then(|| Workload { cgroup: cgroup.clone(), child: None, exit_code: None });
     let cg_id = cgroup_id(&cgroup)?;
     sensor.watch_cgroup(cg_id)?;
 
@@ -136,8 +225,7 @@ pub fn run(
     let mut responses: Vec<Value> = vec![];
 
     // Launch the workload inside the cgroup (moved there before exec).
-    let mut proc_handle = None;
-    if let Some(cmd) = child.take() {
+    if let (Some(cmd), Some(w)) = (child.take(), proc_handle.as_mut()) {
         use std::os::unix::process::CommandExt;
         let procs = std::ffi::CString::new(cgroup.join("cgroup.procs").to_string_lossy().as_bytes())?;
         let mut c = std::process::Command::new(&cmd[0]);
@@ -154,7 +242,7 @@ pub fn run(
                 if r < 0 { Err(std::io::Error::last_os_error()) } else { Ok(()) }
             });
         }
-        proc_handle = Some(c.spawn().with_context(|| format!("starting {}", cmd[0]))?);
+        w.child = Some(c.spawn().with_context(|| format!("starting {}", cmd[0]))?);
     }
 
     eprintln!(
@@ -200,16 +288,7 @@ pub fn run(
         if drain_until.is_none() {
             let stop = opts.stop.load(Ordering::Relaxed)
                 || opts.duration.is_some_and(|d| started.elapsed() >= d);
-            let child_done = match proc_handle.as_mut() {
-                Some(ch) => match ch.try_wait()? {
-                    Some(st) => {
-                        exit_code = st.code();
-                        true
-                    }
-                    None => false,
-                },
-                None => false,
-            };
+            let child_done = proc_handle.as_mut().is_some_and(|w| w.child_exited());
             if stop || child_done {
                 drain_until = Some(Instant::now() + Duration::from_millis(300));
             }
@@ -224,22 +303,17 @@ pub fn run(
         }
     }
 
-    // Run mode: a frozen workload is killed when the session ends (it cannot be resumed
-    // from here); the cgroup is removed.
-    if let Some(mut ch) = proc_handle {
-        if frozen_by.is_some() {
-            let _ = std::fs::write(cgroup.join("cgroup.kill"), "1");
-            let _ = freeze(&cgroup, false);
+    // Run mode: the session owns the workload. Whatever is still running in its cgroup when
+    // the session ends (stopped, timed out, or the launched command exited but left
+    // descendants behind) is terminated, and the cgroup is removed. A frozen workload is
+    // killed outright (it cannot be resumed from here).
+    if let Some(mut w) = proc_handle.take() {
+        let grace = if frozen_by.is_some() { None } else { Some(opts.stop_grace) };
+        if !w.pids().is_empty() {
+            eprintln!("sandwatch: session ended; terminating workload in {}", cgroup.display());
         }
-        if let Ok(st) = ch.wait() {
-            exit_code = exit_code.or(st.code());
-        }
-        for _ in 0..50 {
-            if std::fs::remove_dir(&cgroup).is_ok() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        w.shutdown(grace);
+        exit_code = w.exit_code;
     }
 
     let (ring_drops, pending_drops) = sensor.drops();
@@ -256,6 +330,8 @@ pub fn run(
         "ground_truth": {"phases": phases},
         "sensor_stats": {"ring_buffer_drops": ring_drops, "pending_drops": pending_drops,
                          "runtime_init_events_dropped": norm.dropped_runtime},
+        // Arrival vs timestamp order as seen by live detection (see catena::OrderStats).
+        "catena_stats": engine.order_stats(),
         "responses": responses,
         "workload_exit_code": exit_code,
     }))?;
@@ -268,6 +344,7 @@ pub fn run(
         frozen_by,
         exit_code,
         cgroup,
+        order: engine.order_stats(),
     })
 }
 

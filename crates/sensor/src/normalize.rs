@@ -148,6 +148,19 @@ const NS_FLAGS: &[(u64, &str)] = &[
     (0x0000_0080, "CLONE_NEWTIME"),
 ];
 
+const NS_MASK: u64 = 0x7e02_0080; // OR of NS_FLAGS bits
+
+const SC_SETNS: u32 = 51;
+const SC_CLONE: u32 = 60;
+const SC_CLONE3: u32 = 61;
+const SC_TGKILL: u32 = 66;
+
+/// Clone flags: clone(flags, …) passes them in arg 0 (x86-64 and arm64 ABI); for
+/// clone3(args, size) the BPF side copies `clone_args.flags` out of user memory into a[2].
+fn clone_flags(sc: u32, a: &[u64; 4]) -> u64 {
+    if sc == SC_CLONE3 { a[2] } else { a[0] }
+}
+
 fn ns_flags(v: u64) -> String {
     let names: Vec<&str> = NS_FLAGS.iter().filter(|(b, _)| v & b != 0).map(|(_, n)| *n).collect();
     if names.is_empty() { format!("{v:#x}") } else { names.join("|") }
@@ -361,7 +374,9 @@ impl Normalizer {
     /// fd-only variants without a path, ground-truth markers).
     pub fn normalize(&mut self, r: &RawEvent) -> Option<Value> {
         let denied_before_entry = r.sc & SC_DENIED_BEFORE_ENTRY != 0;
-        let sp = spec(r.sc & !SC_DENIED_BEFORE_ENTRY)?;
+        // Use `sc` (marker stripped) everywhere below, never `r.sc`.
+        let sc = r.sc & !SC_DENIED_BEFORE_ENTRY;
+        let sp = spec(sc)?;
         // Container-runtime plumbing (e.g. `runc init` joining namespaces for `docker exec`)
         // runs inside the watched cgroup before the real command starts. It is not the
         // workload, but its final exec IS the workload starting, so keep execs.
@@ -394,7 +409,14 @@ impl Normalizer {
         let path_raw = cstr(&r.path);
         let path2_raw = cstr(&r.path2);
 
+        // clone/clone3 that create namespaces are reported as namespace changes (the rule
+        // evidence), keeping the child pid; plain forks stay "Fork".
+        let clone_ns = match sc {
+            SC_CLONE | SC_CLONE3 => Some(clone_flags(sc, &r.a) & NS_MASK).filter(|f| *f != 0),
+            _ => None,
+        };
         let (class, act_id, act_name): (u32, u32, &str) = match sp.kind {
+            Kind::Fork if clone_ns.is_some() => (1007, 99, "Namespace Change"),
             Kind::Open => (1001, 14, "Open"),
             Kind::Stat | Kind::Chdir => (1001, 8, "Get Attributes"),
             Kind::Access => (1001, 9, "Get Security"),
@@ -420,8 +442,8 @@ impl Normalizer {
             | Kind::Chdir | Kind::SetSecurity | Kind::Mount | Kind::Unmount => {
                 let dirfd = sp.dirfd.map(|i| r.a[i]);
                 let path = self.resolve(r, &path_raw, dirfd)?;
-                if path.starts_with(MARK_PREFIX) {
-                    self.phases.push((path[MARK_PREFIX.len()..].to_string(), time));
+                if let Some(mark) = path.strip_prefix(MARK_PREFIX) {
+                    self.phases.push((mark.to_string(), time));
                     return None;
                 }
                 let mut file = json!({ "path": path });
@@ -477,7 +499,8 @@ impl Normalizer {
                 }
             }
             Kind::Namespace => {
-                let v = if r.sc == 51 { r.a[1] } else { r.a[0] };
+                // setns(fd, nstype) vs unshare(flags)
+                let v = if sc == SC_SETNS { r.a[1] } else { r.a[0] };
                 unm.insert("flags".into(), json!(ns_flags(v)));
             }
             Kind::Trace => {
@@ -485,13 +508,17 @@ impl Normalizer {
                 extra.insert("process".into(), json!({ "pid": r.a[1] as i32 }));
             }
             Kind::Signal => {
-                let (target, sig) = if r.sc == 66 { (r.a[1], r.a[2]) } else { (r.a[0], r.a[1]) };
+                // tgkill(tgid, tid, sig) vs kill/tkill(pid, sig)
+                let (target, sig) = if sc == SC_TGKILL { (r.a[1], r.a[2]) } else { (r.a[0], r.a[1]) };
                 extra.insert("process".into(), json!({ "pid": target as i32 }));
                 unm.insert("signal".into(), json!(signal_name(sig)));
             }
             Kind::Fork => {
                 if r.ret > 0 {
                     unm.insert("child_pid_ns".into(), json!(r.ret));
+                }
+                if let Some(f) = clone_ns {
+                    unm.insert("flags".into(), json!(ns_flags(f)));
                 }
             }
             Kind::Bpf => {
@@ -570,5 +597,95 @@ mod tests {
     #[test]
     fn ns_flag_names() {
         assert_eq!(ns_flags(0x1000_0000), "CLONE_NEWUSER");
+    }
+
+    #[test]
+    fn ns_mask_covers_every_ns_flag() {
+        assert_eq!(NS_MASK, NS_FLAGS.iter().fold(0, |m, (b, _)| m | b));
+    }
+
+    fn raw(sc: u32, a: [u64; 4], ret: i64) -> RawEvent {
+        // SAFETY: RawEvent is plain old data; all-zero is a valid value.
+        let mut r: RawEvent = unsafe { std::mem::zeroed() };
+        r.sc = sc;
+        r.a = a;
+        r.ret = ret;
+        r.ts_ns = 1_000;
+        r.tgid = 4_000_000; // no such pid: no /proc fallbacks
+        r.pid = 4_000_000;
+        r.comm[..2].copy_from_slice(b"sh");
+        r
+    }
+
+    fn norm(r: &RawEvent) -> Value {
+        Normalizer::new("t").normalize(r).expect("event kept")
+    }
+
+    const NEWUSER: u64 = 0x1000_0000;
+
+    #[test]
+    fn setns_flags_from_arg1_also_when_denied() {
+        for sc in [SC_SETNS, SC_SETNS | SC_DENIED_BEFORE_ENTRY] {
+            let ev = norm(&raw(sc, [3, NEWUSER, 0, 0], -1));
+            assert_eq!(ev["activity_name"], "Namespace Change");
+            assert_eq!(ev["unmapped"]["flags"], "CLONE_NEWUSER", "sc={sc:#x}");
+        }
+        let ev = norm(&raw(SC_SETNS | SC_DENIED_BEFORE_ENTRY, [3, NEWUSER, 0, 0], -1));
+        assert_eq!(ev["unmapped"]["denied_before_entry"], true);
+    }
+
+    #[test]
+    fn unshare_flags_from_arg0() {
+        let ev = norm(&raw(50, [NEWUSER | 0x0002_0000, 0, 0, 0], 0));
+        assert_eq!(ev["unmapped"]["flags"], "CLONE_NEWNS|CLONE_NEWUSER");
+    }
+
+    #[test]
+    fn clone_with_namespace_flags_is_a_namespace_change() {
+        // clone(flags = CLONE_NEWUSER | SIGCHLD)
+        let ev = norm(&raw(SC_CLONE, [NEWUSER | 17, 0, 0, 0], 1234));
+        assert_eq!(ev["activity_name"], "Namespace Change");
+        assert_eq!(ev["unmapped"]["flags"], "CLONE_NEWUSER");
+        assert_eq!(ev["unmapped"]["child_pid_ns"], 1234);
+        // denied by seccomp: same evidence
+        let ev = norm(&raw(SC_CLONE | SC_DENIED_BEFORE_ENTRY, [NEWUSER | 17, 0, 0, 0], -1));
+        assert_eq!(ev["activity_name"], "Namespace Change");
+        assert_eq!(ev["status"], "Failure");
+    }
+
+    #[test]
+    fn clone3_flags_come_from_a2() {
+        // BPF copies clone_args.flags into a[2]; a[0] is the user pointer.
+        let ev = norm(&raw(SC_CLONE3, [0x7fff_0000_1000, 88, NEWUSER, 0], 77));
+        assert_eq!(ev["activity_name"], "Namespace Change");
+        assert_eq!(ev["unmapped"]["flags"], "CLONE_NEWUSER");
+    }
+
+    #[test]
+    fn plain_clone_stays_fork() {
+        // CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD (pthread_create)
+        let ev = norm(&raw(SC_CLONE, [0x0001_0f00, 0, 0, 0], 99));
+        assert_eq!(ev["activity_name"], "Fork");
+        assert!(ev["unmapped"].get("flags").is_none());
+        let ev = norm(&raw(SC_CLONE3, [0x7fff_0000_1000, 88, 0x0001_0f00, 0], 99));
+        assert_eq!(ev["activity_name"], "Fork");
+    }
+
+    #[test]
+    fn tgkill_target_and_signal_also_when_denied() {
+        let ev = norm(&raw(SC_TGKILL | SC_DENIED_BEFORE_ENTRY, [10, 11, 9, 0], -1));
+        assert_eq!(ev["process"]["pid"], 11);
+        assert_eq!(ev["unmapped"]["signal"], "SIGKILL");
+    }
+
+    #[test]
+    fn namespace_rule_matches_clone_evidence() {
+        let rules = catena::load_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/../../rules")).unwrap();
+        let mut ev = norm(&raw(SC_CLONE | SC_DENIED_BEFORE_ENTRY, [NEWUSER | 17, 0, 0, 0], -1));
+        ev["seq"] = json!(1);
+        ev["record_type"] = json!("event");
+        let typed: swrec::Event = serde_json::from_value(ev).unwrap();
+        let alerts = catena::run(&rules, &[typed]);
+        assert!(alerts.iter().any(|a| a.rule_id == "namespace-escape"), "{alerts:?}");
     }
 }

@@ -83,6 +83,10 @@ struct LiveArgs {
     /// Stop after this many seconds.
     #[arg(long)]
     duration: Option<f64>,
+    /// `run` only: when the session stops (duration, Ctrl+C) the workload is sent SIGTERM,
+    /// given this many seconds to exit, then its whole cgroup is killed.
+    #[arg(long, default_value_t = 2.0)]
+    grace: f64,
     /// Embed ground-truth labels from a lab manifest (for evaluation).
     #[arg(long, requires = "scenario")]
     manifest: Option<PathBuf>,
@@ -213,6 +217,8 @@ mod live {
             freeze_on: a.freeze_on.clone(),
             duration: a.duration.map(Duration::from_secs_f64),
             stop,
+            stop_grace: Duration::try_from_secs_f64(a.grace)
+                .context("--grace must be a non-negative number of seconds")?,
         };
         println!("SANDWATCH  live session {session_id}  →  {}\n", out.display());
         let mut on_alert = |al: &catena::Alert, _actor: Option<&str>| {
@@ -229,6 +235,14 @@ mod live {
             "  {} events recorded; {} alerts; sensor drops: ring {} / pending {}",
             o.events, o.alerts.len(), o.ring_drops, o.pending_drops
         );
+        if o.order.reordered_events > 0 {
+            println!(
+                "  {} events arrived out of order (max {:.1} ms late); {} too late for a rule window",
+                o.order.reordered_events,
+                o.order.max_lateness_us as f64 / 1000.0,
+                o.order.late_events_ignored
+            );
+        }
         if let Some(r) = &o.frozen_by {
             println!("  workload FROZEN by {r} ({})", o.cgroup.display());
         }
@@ -243,7 +257,15 @@ fn verify(paths: &[PathBuf]) -> Result<ExitCode> {
     let files = swrec::discover(paths)?;
     let mut bad = 0;
     for f in &files {
-        let (rec, integrity) = swrec::load(f, true)?;
+        // Unreadable (truncated gzip, invalid JSON, …) is a verification failure, not an abort.
+        let (rec, integrity) = match swrec::load(f, true) {
+            Ok(r) => r,
+            Err(e) => {
+                bad += 1;
+                println!("FAIL  {}  -- unreadable: {e:#}", f.display());
+                continue;
+            }
+        };
         match integrity {
             Integrity::Verified => {
                 println!("OK    {}  ({} events)", f.display(), rec.events.len())
@@ -382,7 +404,7 @@ fn eval(rules: &[Rule], paths: &[PathBuf], verbose: bool) -> Result<ExitCode> {
     }
 
     // ---- per-session table
-    println!("{:<26} {:<9} {:<6} {}", "session", "class", "result", "detail");
+    println!("{:<26} {:<9} {:<6} detail", "session", "class", "result");
     println!("{}", "-".repeat(96));
     for r in &results {
         if !verbose && r.pass {
@@ -408,7 +430,7 @@ fn eval(rules: &[Rule], paths: &[PathBuf], verbose: bool) -> Result<ExitCode> {
     }
 
     // ---- per-rule table
-    println!("\n{:<20} {:>4} {:>4} {:>4} {:>6}   {}", "rule", "TP", "FN", "FP", "extra", "recall");
+    println!("\n{:<20} {:>4} {:>4} {:>4} {:>6}   recall", "rule", "TP", "FN", "FP", "extra");
     println!("{}", "-".repeat(56));
     for rule in rules {
         let id = rule.id();
@@ -422,7 +444,7 @@ fn eval(rules: &[Rule], paths: &[PathBuf], verbose: bool) -> Result<ExitCode> {
             if r.forbidden_hit.iter().any(|f| f == id) { fp += 1; }
         }
         let recall = if tp + fnn == 0 { "-".to_string() } else { format!("{:.0}%", 100.0 * tp as f64 / (tp + fnn) as f64) };
-        println!("{:<20} {:>4} {:>4} {:>4} {:>6}   {}", id, tp, fnn, fp, extra, recall);
+        println!("{id:<20} {tp:>4} {fnn:>4} {fp:>4} {extra:>6}   {recall}");
     }
 
     // ---- summary

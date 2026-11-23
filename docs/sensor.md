@@ -53,6 +53,10 @@ what the sensor is watching for.
   registers (x86-64) and records the event with `unmapped.denied_before_entry: true`. This
   is how Sandwatch sees a blocked `unshare(CLONE_NEWUSER)` inside Docker. (strace sees these
   calls only because ptrace runs before seccomp.)
+- **Namespace creation through `clone`/`clone3`.** `clone` passes its flags in a register.
+  `clone3` passes a pointer to `struct clone_args`, so the sensor copies `clone_args.flags`
+  out of user memory. A clone with any `CLONE_NEW*` flag is reported as a
+  `Namespace Change` event (with the child pid when it succeeded); other clones stay `Fork`.
 - **Loss accounting.** Ring-buffer and pending-map overflows are counted in kernel and
   reported in the recording's footer (`sensor_stats`). A recording never silently claims
   completeness.
@@ -78,12 +82,20 @@ rule fires. Every process in it stops immediately. Nothing is killed or deleted,
 evidence and process state stay intact.
 - In `watch` mode the workload stays frozen. Inspect it, then run `sandwatch thaw` or
   remove the container.
-- In `run` mode the frozen workload is killed when the session ends.
+- In `run` mode the session owns the workload. When the session ends, everything still in
+  its cgroup is terminated, including descendants left behind by the launched command, and
+  the cgroup is removed. This also happens if the session fails partway through.
+  - Session stopped by `--duration` or Ctrl+C: the workload gets SIGTERM, `--grace`
+    seconds to exit (default 2), then `cgroup.kill`.
+  - Frozen workload: killed straight away, because frozen processes cannot handle SIGTERM.
 
 ## Known limitations (v0.3)
 
 - **x86-64 only** for recovering arguments of seccomp-denied calls. On other architectures
-  those events arrive without paths or flags.
+  those events arrive without paths or flags, so a denied `unshare`/`setns`/`clone` there
+  carries no namespace flags and the namespace rule cannot match it.
+- **`clone3` flags are read from user memory at syscall entry.** In theory another thread
+  could change them before the kernel copies them in.
 - **Path resolution is best-effort.** It covers relative paths through cwd and directory
   fds; `dup`/`fcntl` fd tricks are not tracked.
 - **One session per sensor process.** Fleet mode (many containers, one daemon) is planned.

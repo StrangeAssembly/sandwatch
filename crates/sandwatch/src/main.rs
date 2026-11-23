@@ -233,8 +233,8 @@ mod live {
             println!("  no alerts");
         }
         println!(
-            "  {} events recorded; {} alerts; sensor drops: ring {} / pending {}",
-            o.events, o.alerts.len(), o.ring_drops, o.pending_drops
+            "  {} events recorded; {} alerts; sensor drops: ring {} / pending {} / burst buffer {}",
+            o.events, o.alerts.len(), o.ring_drops, o.pending_drops, o.buffer_drops
         );
         if o.order.reordered_events > 0 {
             println!(

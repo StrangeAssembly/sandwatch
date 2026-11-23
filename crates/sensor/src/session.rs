@@ -7,7 +7,7 @@ use catena::{Alert, Engine, Rule};
 use serde_json::{json, Value};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -30,6 +30,97 @@ pub struct Options {
     pub stop: Arc<AtomicBool>,
     /// Run mode: how long the workload gets to exit after SIGTERM before its cgroup is killed.
     pub stop_grace: Duration,
+}
+
+/// Size cap of the in-memory burst buffer between the ring-buffer reader and detection.
+/// At ~360 bytes per typical record this holds ~700k events: tens of seconds of a busy agent.
+const BURST_BUFFER_BYTES: usize = 256 << 20;
+
+/// Records drained from the kernel in one go: concatenated bytes plus each record's length.
+#[derive(Default)]
+struct Batch {
+    data: Vec<u8>,
+    lens: Vec<u32>,
+}
+
+impl Batch {
+    fn records(&self) -> impl Iterator<Item = &[u8]> {
+        let mut off = 0usize;
+        self.lens.iter().map(move |&n| {
+            let r = &self.data[off..off + n as usize];
+            off += n as usize;
+            r
+        })
+    }
+}
+
+/// Thread that only copies records out of the kernel ring buffer (cheap), so the kernel
+/// buffer stays empty while the slower normalize/detect/record pipeline catches up.
+struct RingReader {
+    rx: std::sync::mpsc::Receiver<Batch>,
+    in_flight: Arc<AtomicUsize>,
+    dropped: Arc<AtomicU64>,
+    handle: std::thread::JoinHandle<()>,
+}
+
+impl RingReader {
+    fn spawn(
+        mut ring: aya::maps::RingBuf<aya::maps::MapData>,
+        stop: Arc<AtomicBool>,
+        cap: usize,
+    ) -> Result<Self> {
+        let (tx, rx) = std::sync::mpsc::channel::<Batch>();
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let dropped = Arc::new(AtomicU64::new(0));
+        let (inf, drp) = (in_flight.clone(), dropped.clone());
+        let handle = std::thread::Builder::new().name("ring-reader".into()).spawn(move || {
+            const BATCH: usize = 4096;
+            loop {
+                // Read the flag before draining: after it is set, one more full drain runs.
+                let stopping = stop.load(Ordering::Acquire);
+                let mut b = Batch::default();
+                while let Some(item) = ring.next() {
+                    if inf.load(Ordering::Relaxed) + b.data.len() + item.len() > cap {
+                        drp.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                    b.data.extend_from_slice(&item);
+                    b.lens.push(item.len() as u32);
+                    if b.lens.len() >= BATCH {
+                        inf.fetch_add(b.data.len(), Ordering::Relaxed);
+                        if tx.send(std::mem::take(&mut b)).is_err() {
+                            return;
+                        }
+                    }
+                }
+                if !b.lens.is_empty() {
+                    inf.fetch_add(b.data.len(), Ordering::Relaxed);
+                    if tx.send(b).is_err() {
+                        return;
+                    }
+                }
+                if stopping {
+                    return; // dropping `tx` tells the consumer everything has been sent
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        })?;
+        Ok(RingReader { rx, in_flight, dropped, handle })
+    }
+
+    /// The consumer finished with `bytes` of buffered records.
+    fn release(&self, bytes: usize) {
+        self.in_flight.fetch_sub(bytes, Ordering::Relaxed);
+    }
+
+    fn dropped(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
+    }
+
+    fn join(self) -> u64 {
+        let _ = self.handle.join();
+        self.dropped.load(Ordering::Relaxed)
+    }
 }
 
 /// A workload launched by `run`, owned by the session. The session owns everything in the
@@ -119,6 +210,8 @@ pub struct Outcome {
     pub alerts: Vec<Alert>,
     pub ring_drops: u64,
     pub pending_drops: u64,
+    /// Records the kernel delivered but the in-memory burst buffer had no room for.
+    pub buffer_drops: u64,
     pub frozen_by: Option<String>,
     pub exit_code: Option<i32>,
     pub cgroup: PathBuf,
@@ -270,31 +363,47 @@ pub fn run(
         if sensor.skipped.is_empty() { String::new() } else { format!(", {} unavailable on this kernel", sensor.skipped.len()) }
     );
 
+    // A dedicated thread drains the kernel ring buffer into an in-memory burst buffer, so a
+    // short spike of activity waits in memory instead of overflowing the kernel buffer while
+    // normalization and detection catch up. The burst buffer is capped (BURST_BUFFER_BYTES);
+    // records over the cap are counted as buffer drops.
+    let reader_stop = Arc::new(AtomicBool::new(false));
+    let reader = RingReader::spawn(
+        sensor.take_ring().context("ring buffer already taken")?,
+        reader_stop.clone(),
+        BURST_BUFFER_BYTES,
+    )?;
+
     let started = Instant::now();
     let mut exit_code = None;
     let mut drain_until: Option<Instant> = None;
-    // Live loss warning: detection is blind while the kernel drops events, so say so as it
+    // Live loss warning: detection is blind while events are dropped, so say so as it
     // happens (at most once a second), not only in the footer.
     let mut last_drop_check = Instant::now();
-    let mut reported_drops = (0u64, 0u64);
+    let mut reported_drops = (0u64, 0u64, 0u64);
     loop {
         if last_drop_check.elapsed() >= Duration::from_secs(1) {
             last_drop_check = Instant::now();
-            let d = sensor.drops();
+            let (r, p) = sensor.drops();
+            let d = (r, p, reader.dropped());
             if d != reported_drops {
                 eprintln!(
-                    "sandwatch: WARNING sensor is losing events (ring buffer {} / pending {} so far); \
-                     detection is incomplete while this lasts",
-                    d.0, d.1
+                    "sandwatch: WARNING sensor is losing events (ring buffer {} / pending {} / \
+                     burst buffer {} so far); detection is incomplete while this lasts",
+                    d.0, d.1, d.2
                 );
                 reported_drops = d;
             }
         }
-        let mut got = 0usize;
-        while let Some(item) = sensor.ring.next() {
-            got += 1;
-            let Some(raw) = RawEvent::from_bytes(&item) else { continue };
-            drop(item);
+        let batch = match reader.rx.recv_timeout(Duration::from_millis(3)) {
+            Ok(b) => b,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Batch::default(),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break, // reader finished
+        };
+        let got = batch.lens.len();
+        reader.release(batch.data.len());
+        for rec in batch.records() {
+            let Some(raw) = RawEvent::from_bytes(rec) else { continue };
             let Some(mut ev) = norm.normalize(&raw) else { continue };
             ev["seq"] = json!(seq + 1);
             ev["record_type"] = json!("event");
@@ -320,6 +429,7 @@ pub fn run(
             }
             if tx.send(ev).is_err() {
                 // The writer stopped (e.g. disk full): surface its error.
+                reader_stop.store(true, Ordering::Release);
                 drop(tx);
                 join_writer(writer_thread)?;
                 anyhow::bail!("recording writer stopped unexpectedly");
@@ -334,15 +444,18 @@ pub fn run(
                 drain_until = Some(Instant::now() + Duration::from_millis(300));
             }
         }
+        // After the drain period, ask the reader to empty the kernel buffer one last time and
+        // finish; the loop ends when it disconnects, after everything it sent is processed.
         if let Some(t) = drain_until {
-            if Instant::now() >= t && got == 0 {
-                break;
+            // (Hard limit 2 s after the drain period, so a workload that never goes quiet
+            // cannot keep the session open.)
+            let now = Instant::now();
+            if now >= t && (got == 0 || now >= t + Duration::from_secs(2)) {
+                reader_stop.store(true, Ordering::Release);
             }
         }
-        if got == 0 {
-            std::thread::sleep(Duration::from_millis(3));
-        }
     }
+    let buffer_drops = reader.join();
 
     // Run mode: the session owns the workload. Whatever is still running in its cgroup when
     // the session ends (stopped, timed out, or the launched command exited but left
@@ -372,6 +485,7 @@ pub fn run(
         "start_time": norm.start_epoch_ms(),
         "ground_truth": {"phases": phases},
         "sensor_stats": {"ring_buffer_drops": ring_drops, "pending_drops": pending_drops,
+                         "burst_buffer_drops": buffer_drops,
                          "runtime_init_events_dropped": norm.dropped_runtime},
         // Arrival vs timestamp order as seen by live detection (see catena::OrderStats).
         "catena_stats": engine.order_stats(),
@@ -384,6 +498,7 @@ pub fn run(
         alerts: engine.alerts().to_vec(),
         ring_drops,
         pending_drops,
+        buffer_drops,
         frozen_by,
         exit_code,
         cgroup,
@@ -412,4 +527,21 @@ fn chrono_like_now() -> String {
     let mo = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if mo <= 2 { y + 1 } else { y };
     format!("{y:04}-{mo:02}-{d:02}T{h:02}:{m:02}:{s:02}Z")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Batch;
+
+    #[test]
+    fn batch_splits_records_back_out() {
+        let mut b = Batch::default();
+        for rec in [&b"abc"[..], &b""[..], &b"de"[..]] {
+            b.data.extend_from_slice(rec);
+            b.lens.push(rec.len() as u32);
+        }
+        let got: Vec<&[u8]> = b.records().collect();
+        assert_eq!(got, vec![&b"abc"[..], &b""[..], &b"de"[..]]);
+        assert_eq!(Batch::default().records().count(), 0);
+    }
 }

@@ -64,7 +64,7 @@ static BPF_OBJ: &[u8] = aya::include_bytes_aligned!(concat!(env!("OUT_DIR"), "/s
 
 pub struct Sensor {
     ebpf: Ebpf,
-    pub ring: RingBuf<MapData>,
+    ring: Option<RingBuf<MapData>>,
     pub attached: usize,
     pub skipped: Vec<String>,
 }
@@ -133,7 +133,12 @@ impl Sensor {
             bail!("no tracepoints attached; is tracefs available?");
         }
         let ring = RingBuf::try_from(ebpf.take_map("events").context("events map")?)?;
-        Ok(Sensor { ebpf, ring, attached, skipped })
+        Ok(Sensor { ebpf, ring: Some(ring), attached, skipped })
+    }
+
+    /// Hand the ring buffer to a dedicated reader (it can only be taken once).
+    pub fn take_ring(&mut self) -> Option<RingBuf<MapData>> {
+        self.ring.take()
     }
 
     /// Watch every task in this cgroup (and its descendants).

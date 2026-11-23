@@ -104,19 +104,32 @@ evidence and process state stay intact.
   - records are sized to the fields they use (~360 bytes instead of 1000);
   - the ring buffer is 64 MB;
   - the producer skips per-event wakeups;
-  - recording (canonical JSON, hashing, gzip at the fast level) runs on its own thread.
+  - recording (canonical JSON, hashing, gzip at the fast level) runs on its own thread;
+  - a reader thread drains the kernel buffer into a 256 MB in-memory burst buffer, so
+    spikes wait in memory while detection catches up.
 
-  `lab/stress/syscall_storm.py` on a 4-vCPU VM:
+  `lab/stress/syscall_storm.py` on a 4-vCPU VM. Loss depends on the syscall rate:
 
-  | busy processes | syscalls/s | lost before | lost now |
-  |---|---|---|---|
-  | 1 | ~260k | 74% | 0% |
-  | 2 | ~400k | 87% | 31% |
-  | 4 | ~600k | 91% | 61% |
+  | syscalls/s | lost (original sensor) | lost now |
+  |---|---|---|
+  | ~260k | 74% | 0% |
+  | 310k–440k | 87–91% | 0% |
+  | ~510k | — | 33% |
+  | 845k–915k | 91% | 61–68% |
 
-  Loss is counted in the footer (`sensor_stats`) and warned about live. Detection is blind
-  while it lasts. Next steps: kernel-side filtering of high-volume, low-value calls (e.g.
-  successful `stat` of non-sensitive paths) and parallel normalization.
+  For scale, the busiest 100 ms of the three recorded real agent sessions peaked at 121k
+  events/s (31k–33k in the other two); the median was 20–30/s. Above roughly 500k/s the
+  limit is contention inside the single shared kernel ring buffer: four CPUs reserving
+  records in it at once. Giving the reader more CPU, even real-time priority, does not help.
+  Next steps:
+  - one ring buffer per CPU;
+  - kernel-side filtering of high-volume, low-value calls (e.g. repeated successful `stat`
+    of the same non-sensitive path).
+
+  Loss is counted in the footer (`sensor_stats`: ring buffer, pending map, burst buffer)
+  and warned about live. Detection is blind while it lasts. A workload can **deliberately**
+  flood syscalls to cause this, so sustained loss should itself be treated as suspicious. A
+  rule for it is planned.
 - **One session per sensor process.** Fleet mode (many containers, one daemon) is planned.
 - **Capture limits.** argv is captured up to 6 arguments × 64 bytes, and paths up to 256 bytes.
 - **Seccomp-denied calls the sensor doesn't trace** (for example `keyctl`) are not seen.

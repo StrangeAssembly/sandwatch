@@ -183,7 +183,8 @@ mod live {
             "expected_detections": s.get("expected_detections").cloned().unwrap_or(json!([])),
             "synthetic": true,
         });
-        for k in ["forbidden_detections", "hard_negative", "notes"] {
+        // `synthetic` defaults to true (scripted lab) but real-agent manifests set it false.
+        for k in ["forbidden_detections", "hard_negative", "notes", "synthetic"] {
             if let Some(v) = s.get(k) {
                 l[k] = v.clone();
             }

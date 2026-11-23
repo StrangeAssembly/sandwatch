@@ -122,6 +122,7 @@ def main():
     ap.add_argument("src")
     ap.add_argument("dst")
     ap.add_argument("--term", action="append", default=[], help="extra text to redact (repeatable)")
+    ap.add_argument("--note", help="append a note to the header's labels.notes (e.g. caveats)")
     a = ap.parse_args()
     if os.path.abspath(a.src) == os.path.abspath(a.dst):
         sys.exit("refusing to overwrite the original; write to a new file")
@@ -148,6 +149,9 @@ def main():
                 "rules": ["uuid", "synced-item-names", "local-homes", "user-host-terms", "email", "secrets"],
                 "source_final_hash": original_final,
             }
+            if a.note:
+                labels = obj.setdefault("labels", {})
+                labels["notes"] = (labels.get("notes", "") + " " + a.note).strip()
         if obj.get("record_type") == "footer":
             obj["final_event_hash"] = prev
         obj["prev_hash"] = prev

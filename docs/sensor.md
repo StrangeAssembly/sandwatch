@@ -98,6 +98,11 @@ evidence and process state stay intact.
   could change them before the kernel copies them in.
 - **Path resolution is best-effort.** It covers relative paths through cwd and directory
   fds; `dup`/`fcntl` fd tricks are not tracked.
+- **Event loss under heavy load.** In a real session, a burst of `pip install` work on a
+  4-vCPU VM overflowed the 16 MB ring buffer and lost about 45k events (23%). The loss is
+  counted in the footer (`sensor_stats.ring_buffer_drops`), but detection is blind during
+  it. A larger buffer, a faster consumer, and kernel-side filtering of high-volume,
+  low-value calls are planned.
 - **One session per sensor process.** Fleet mode (many containers, one daemon) is planned.
 - **Capture limits.** argv is captured up to 6 arguments × 64 bytes, and paths up to 256 bytes.
 - **Seccomp-denied calls the sensor doesn't trace** (for example `keyctl`) are not seen.

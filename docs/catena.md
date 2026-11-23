@@ -132,6 +132,10 @@ minutes in:
 
 Process listers are now excluded from those two rules (`actor_name_none`), and ENETUNREACH
 no longer counts as a failed probe for `egress-expand`. The lab results are unchanged.
+Two more real sessions (project setup, DevOps chores), recorded after the fix, raise no
+alerts. Under the v0.3 rules they would have: the setup session again produced the full
+chain. They share the same causes (routine `ps aux`, IPv6-less pip), so they confirm the fix
+rather than test it independently.
 Caveats:
 - Exclusions by program name can be evaded by an attacker who names a tool `ps`.
 - One session is not a benchmark. More real sessions are needed before these thresholds

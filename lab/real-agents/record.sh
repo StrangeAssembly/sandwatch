@@ -4,8 +4,9 @@
 #   lab/real-agents/record.sh <scenario-id> <seed>      e.g.  real-bugfix 1
 #
 # 1. starts the agent container (sign-in state persists in the `sandwatch-agent-home` volume)
-# 2. starts the sensor watching it, writing recordings/real/<scenario>-s<seed>.swrec.gz
-# 3. opens a shell in the container: run `claude`, give it the task, exit when done
+# 2. starts the sensor watching it, writing recordings/real/raw/<scenario>-s<seed>.swrec.gz
+# 3. starts `claude` in the container: give it the task; `/exit` ends the recording
+#    (set AGENT_CMD to record a different agent, e.g. AGENT_CMD=bash for a shell)
 # 4. stops the sensor and the container
 #
 # Recordings land in recordings/real/raw/ (git-ignored: they identify the recording machine
@@ -30,8 +31,9 @@ sudo "$SW" watch --container "$CID" -o "$OUT" --session-id "$SCEN-s$SEED" \
 SENSOR=$!
 sleep 6   # let the sensor attach its tracepoints
 
-echo "Recording $SCEN (seed $SEED). In the shell: run 'claude', give it the task, exit when done."
-docker exec -it "$CID" bash -l || true
+echo "Recording $SCEN (seed $SEED). Give the agent its task; /exit ends the recording."
+docker exec -it "$CID" bash -lc "${AGENT_CMD:-claude}" || true
+echo "Agent exited; finishing the recording..."
 
 # Signal the sensor itself: background jobs of a script ignore SIGINT, so `sudo` (which is
 # $SENSOR) would not pass it on and the recording would never be finished.

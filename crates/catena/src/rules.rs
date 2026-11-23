@@ -161,9 +161,15 @@ enum IpMatcher {
 impl IpMatcher {
     fn parse(s: &str) -> Result<Self> {
         if let Some((addr, bits)) = s.split_once('/') {
-            Ok(IpMatcher::Cidr(addr.parse()?, bits.parse()?))
+            let addr: IpAddr = addr.parse().with_context(|| format!("bad address in {s:?}"))?;
+            let bits: u8 = bits.parse().with_context(|| format!("bad prefix length in {s:?}"))?;
+            let max = if addr.is_ipv4() { 32 } else { 128 };
+            if bits > max {
+                bail!("prefix length /{bits} out of range for {s:?} (max /{max})");
+            }
+            Ok(IpMatcher::Cidr(addr, bits))
         } else {
-            Ok(IpMatcher::Exact(s.parse()?))
+            Ok(IpMatcher::Exact(s.parse().with_context(|| format!("bad address {s:?}"))?))
         }
     }
     fn matches(&self, ip: &IpAddr) -> bool {
@@ -210,6 +216,7 @@ impl Rule {
                 }
             }
         }
+        validate(&def).with_context(ctx)?;
         let m = def.matcher.clone().unwrap_or_default();
         let class_uid = match m.class.as_deref() {
             None => None,
@@ -328,6 +335,73 @@ impl Rule {
     }
 }
 
+fn positive_window(w: f64) -> Result<()> {
+    if !(w.is_finite() && w > 0.0) {
+        bail!("window_s must be a finite number > 0 (got {w})");
+    }
+    Ok(())
+}
+
+/// Semantic checks beyond what serde enforces: values that would make a rule silently never
+/// fire, always fire, or misbehave at match time are rejected at load time.
+fn validate(def: &RuleDef) -> Result<()> {
+    if def.id.trim().is_empty() {
+        bail!("id must not be empty");
+    }
+    if let Some(m) = &def.matcher {
+        match m.status.as_deref() {
+            None | Some("any" | "success" | "failure") => {}
+            Some(s) => bail!("match.status must be any | success | failure (got {s:?})"),
+        }
+        match m.access.as_deref() {
+            None | Some("read" | "write") => {}
+            Some(s) => bail!("match.access must be read | write (got {s:?})"),
+        }
+        let constrained = m.class.is_some()
+            || !m.activities.is_empty()
+            || !m.path_any.is_empty()
+            || !m.path_none.is_empty()
+            || !m.actor_name_any.is_empty()
+            || !m.dst_ip_any.is_empty()
+            || !m.dst_ip_none.is_empty()
+            || !m.dst_port_any.is_empty()
+            || !m.dst_port_none.is_empty()
+            || !m.flags_any.is_empty()
+            || m.access.is_some()
+            || matches!(m.status.as_deref(), Some("success" | "failure"));
+        if !constrained {
+            bail!("match has no constraints and would match every event");
+        }
+    }
+    if let Some(a) = &def.aggregate {
+        positive_window(a.window_s)?;
+        if a.min_distinct == 0 {
+            bail!("aggregate.min_distinct must be >= 1");
+        }
+        if a.min_failures > a.min_distinct {
+            bail!(
+                "aggregate.min_failures ({}) > min_distinct ({}): the rule could never fire",
+                a.min_failures,
+                a.min_distinct
+            );
+        }
+        if !(a.min_failure_ratio.is_finite() && (0.0..=1.0).contains(&a.min_failure_ratio)) {
+            bail!("aggregate.min_failure_ratio must be within 0.0–1.0 (got {})", a.min_failure_ratio);
+        }
+        let needs_failures = a.min_failures > 0 || a.min_failure_ratio > 0.0;
+        if needs_failures && a.failure_errnos.is_empty() {
+            bail!("aggregate requires failures but failure_errnos is empty");
+        }
+    }
+    if let Some(c) = &def.chain {
+        positive_window(c.window_s)?;
+        if c.min_stages < 2 {
+            bail!("chain.min_stages must be >= 2 (a chain links distinct stages)");
+        }
+    }
+    Ok(())
+}
+
 /// What an event "touched": the unit rules count distinct values of.
 pub fn target_key(ev: &Event) -> String {
     if let Some(p) = ev.path() {
@@ -368,4 +442,127 @@ pub fn load_dir(dir: impl AsRef<Path>) -> Result<Vec<Rule>> {
         }
     }
     Ok(rules)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn compile(yaml: &str) -> Result<Rule> {
+        Rule::compile(serde_yaml::from_str(yaml)?)
+    }
+
+    fn detect(matcher: &str, aggregate: &str) -> String {
+        format!("id: t\nname: t\nseverity: low\ndescription: t\nmatch:\n{matcher}\naggregate:\n{aggregate}\n")
+    }
+
+    fn ok_match(matcher: &str) -> Rule {
+        compile(&detect(matcher, "  window_s: 10")).expect("compiles")
+    }
+
+    fn net_ev(ip: &str, port: u16) -> Event {
+        serde_json::from_value(json!({
+            "seq": 1, "time": 0, "class_uid": 4001, "activity_id": 1, "activity_name": "Open",
+            "status": "Success", "actor": {"process": {"uid": "p", "pid": 1, "name": "curl"}},
+            "dst_endpoint": {"ip": ip, "port": port}, "unmapped": {"t_us": 0}
+        }))
+        .unwrap()
+    }
+
+    fn file_ev(path: &str, status: &str, access: Option<&str>, actor: &str) -> Event {
+        serde_json::from_value(json!({
+            "seq": 1, "time": 0, "class_uid": 1001, "activity_id": 14, "activity_name": "Open",
+            "status": status, "actor": {"process": {"uid": "p", "pid": 1, "name": actor}},
+            "file": {"path": path}, "unmapped": {"t_us": 0, "access": access}
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn cidr_edges() {
+        let any = ok_match("  dst_ip_any: ['0.0.0.0/0']");
+        assert!(any.match_event(&net_ev("8.8.8.8", 53)).is_some());
+        assert!(any.match_event(&net_ev("::1", 53)).is_none(), "v4 net never matches v6");
+        let host = ok_match("  dst_ip_any: ['10.0.0.1/32', '2001:db8::1/128']");
+        assert!(host.match_event(&net_ev("10.0.0.1", 1)).is_some());
+        assert!(host.match_event(&net_ev("10.0.0.2", 1)).is_none());
+        assert!(host.match_event(&net_ev("2001:db8::1", 1)).is_some());
+        let net = ok_match("  dst_ip_any: ['10.66.0.0/16']");
+        assert!(net.match_event(&net_ev("10.66.200.3", 1)).is_some());
+        assert!(net.match_event(&net_ev("10.67.0.1", 1)).is_none());
+        let v6all = ok_match("  dst_ip_any: ['::/0']");
+        assert!(v6all.match_event(&net_ev("fe80::1", 1)).is_some());
+    }
+
+    #[test]
+    fn bad_cidrs_rejected_at_load() {
+        for bad in ["10.0.0.0/33", "::/129", "10.0.0.0/x", "10.0.0/8", "nope"] {
+            let r = compile(&detect(&format!("  dst_ip_any: ['{bad}']"), "  window_s: 10"));
+            assert!(r.is_err(), "{bad} should be rejected");
+        }
+    }
+
+    #[test]
+    fn ip_none_and_ports() {
+        let r = ok_match("  class: network\n  dst_ip_none: ['127.0.0.0/8']\n  dst_port_none: [53]");
+        assert!(r.match_event(&net_ev("127.0.0.5", 80)).is_none());
+        assert!(r.match_event(&net_ev("1.2.3.4", 53)).is_none());
+        assert_eq!(r.match_event(&net_ev("1.2.3.4", 443)).as_deref(), Some("1.2.3.4:443"));
+        let p = ok_match("  dst_port_any: [80, 443]");
+        assert!(p.match_event(&net_ev("1.2.3.4", 22)).is_none());
+    }
+
+    #[test]
+    fn status_access_actor_filters() {
+        let fail = ok_match("  status: failure");
+        assert!(fail.match_event(&file_ev("/x", "Failure", None, "cat")).is_some());
+        assert!(fail.match_event(&file_ev("/x", "Success", None, "cat")).is_none());
+        let read = ok_match("  access: read");
+        assert!(read.match_event(&file_ev("/x", "Success", Some("read"), "cat")).is_some());
+        assert!(read.match_event(&file_ev("/x", "Success", Some("write"), "cat")).is_none());
+        let tar = ok_match("  actor_name_any: [tar, zip]");
+        assert!(tar.match_event(&file_ev("/x", "Success", None, "tar")).is_some());
+        assert!(tar.match_event(&file_ev("/x", "Success", None, "cat")).is_none());
+    }
+
+    #[test]
+    fn path_any_none_and_basename() {
+        let r = compile(&detect(
+            "  path_any: ['/\\.ssh/']\n  path_none: ['\\.pub$']",
+            "  window_s: 10\n  distinct_by: basename",
+        ))
+        .unwrap();
+        assert_eq!(r.match_event(&file_ev("/root/.ssh/id_rsa", "Success", None, "cat")).as_deref(), Some("id_rsa"));
+        assert!(r.match_event(&file_ev("/root/.ssh/id_rsa.pub", "Success", None, "cat")).is_none());
+        assert!(r.match_event(&file_ev("/etc/passwd", "Success", None, "cat")).is_none());
+    }
+
+    #[test]
+    fn semantic_validation() {
+        let bad_aggs = [
+            "  window_s: 0",
+            "  window_s: -1",
+            "  window_s: .nan",
+            "  window_s: .inf",
+            "  window_s: 10\n  min_distinct: 0",
+            "  window_s: 10\n  min_distinct: 2\n  min_failures: 3",
+            "  window_s: 10\n  min_failure_ratio: 1.5",
+            "  window_s: 10\n  min_failures: 1\n  failure_errnos: []",
+        ];
+        for a in bad_aggs {
+            assert!(compile(&detect("  class: file", a)).is_err(), "should reject: {a}");
+        }
+        for m in ["  status: failed", "  access: rw", "  status: any", "  activities: []"] {
+            assert!(compile(&detect(m, "  window_s: 10")).is_err(), "should reject: {m}");
+        }
+        let chain = |stages: u32, w: &str| {
+            compile(&format!(
+                "id: c\nname: c\nkind: chain\nseverity: high\ndescription: t\nchain:\n  min_stages: {stages}\n  window_s: {w}\n"
+            ))
+        };
+        assert!(chain(1, "60").is_err());
+        assert!(chain(3, "0").is_err());
+        assert!(chain(3, "600").is_ok());
+    }
 }
